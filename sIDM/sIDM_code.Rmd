@@ -1,0 +1,3337 @@
+---
+title: "Code for Streamlined Integrated Distribution Models"
+output: pdf_document
+date: "2025-09-05"
+---
+
+# Set up 
+
+```{r setup, include=FALSE}
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+###
+### Packages
+###
+
+library(abind)
+library(bayesplot)
+library(Bolstad2)
+library(Boom)
+library(cmdstanr)
+library(cowplot)
+library(daymetr)
+library(dbscan)
+library(doParallel)
+library(elevatr)
+library(fastmatrix)
+library(furrr)
+library(ggh4x)
+library(ggridges)
+library(ggspatial)
+library(gridExtra)
+library(igraph)
+library(lwgeom)
+library(Matrix)
+library(mcmcse)
+library(patchwork)
+library(posterior)
+library(raster)
+library(readxl)
+library(sf)
+library(sfnetworks)
+library(sp)
+library(SSN2)
+library(SSNbler)
+library(terra)
+library(tidyverse)
+library(units)
+library(wesanderson)
+library(xtable)
+###
+### Functions 
+###
+
+source("algorithms/MCMC.R")
+```
+
+
+# Data preparation for brook trout analysis (only for viewing: data not available due to size restrictions, will be made available upon request or publication) 
+
+## Read in data 
+
+```{r, read in data}
+
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+###
+### Load Data
+###
+
+# Select years (there is a weird gap in coverage between 2004-2012)
+years <- 2012:2024
+
+# Bring in multiple-pass count data North Carolina 
+count_data <- 
+  read.csv(file="Data/NC_count.csv") %>%
+  # Define new columns 
+  mutate(
+    Date=mdy(Date),
+    year=year(Date),
+    data_type="Count",
+    # Calculate area surveyed 
+    Area=Site_Length_m*Site_Width_m,
+  ) %>%
+  filter(
+    Event_ID != 509, # randomly Site_ID==5 was sampled for one pass in August 20188 when it already had been sampled in July 
+    year %in% years,
+    Species == "BKT"
+  ) %>%
+  # Summarize total # fish caught per site per visit per pass
+  group_by(Site_ID, Date, year, Pass, Longitude, Latitude, Area, data_type) %>% # grouping by sid, Date, Pass gives same result just keeping columns
+  summarise(count=n(),
+            Area=mean(Area, na.rm=TRUE)) %>%
+  # Ungroup 
+  ungroup() %>%
+  # Pivot to make a unique column for each pass 
+  pivot_wider(
+    id_cols = c(Site_ID, Date, year, Longitude, Latitude, Area, data_type),
+    names_from = Pass,
+    values_from = count,
+    names_prefix = "Pass_"
+  ) %>%
+  mutate(
+    y_sum = rowSums(dplyr::select(., starts_with("Pass_")), na.rm = TRUE),
+    density = y_sum / Area * 1000 # Fish per square kilometer / 1000 of water
+  ) %>%
+  # Need sites with known coordinates and Areas
+  filter(
+    !is.na(Longitude), !is.na(Latitude),
+    !is.na(Area),
+    # One site has Pass_1 and Pass_2 NA but Pass_3 observed, we're removing it. 
+    !is.na(Pass_1) 
+  ) %>%
+  # Make spatial
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  # Go to projected coordinate system 32119 is NC
+  st_transform(crs = 32119) 
+  
+# Function to calculate minimum non-zero distance between sites in a given year
+min_distance_per_year <- count_data %>%
+  group_by(year) %>%
+  # Keep only one point per unique site per year
+  distinct(Site_ID, .keep_all = TRUE) %>%
+  group_split() %>%
+  map_dfr(~{
+    dat <- .x
+    if (nrow(dat) < 2) {
+      # Not enough sites to compute pairwise distances
+      tibble(year = unique(dat$year), min_distance = NA_real_)
+    } else {
+      dist_matrix <- st_distance(dat)
+      dist_matrix <- units::drop_units(dist_matrix)
+      # Remove diagonal and duplicate entries (lower triangle)
+      dist_matrix[lower.tri(dist_matrix, diag = TRUE)] <- NA
+      tibble(
+        year = unique(dat$year),
+        min_distance = min(dist_matrix, na.rm = TRUE)
+      )
+    }
+  })
+
+
+###
+### Create new site id based on locations within minimum distance 
+###
+
+# Step 1: Get global min_distance threshold
+min_distance <- min(min_distance_per_year$min_distance, na.rm = TRUE)-1
+
+# Step 2: Extract unique site geometries (across all years)
+unique_sites <- count_data %>%
+  distinct(Site_ID, .keep_all = TRUE)
+
+# Step 3: Create a spatial graph of proximity
+within_dist_list <- st_is_within_distance(unique_sites, dist = min_distance)
+
+# Step 4: Build a graph where nodes are sites and edges connect sites within min_distance
+g <- graph_from_adj_list(within_dist_list, mode = "all")
+
+# Step 5: Identify connected components
+clusters <- components(g)
+
+# Step 6: Assign new site IDs based on cluster membership
+unique_sites <- unique_sites %>%
+  mutate(sid = clusters$membership)
+
+# Step 7: Join new_sid back to original count_data
+count_data <- count_data %>%
+  left_join(unique_sites %>% st_drop_geometry() %>% dplyr::select("Site_ID", sid), by = "Site_ID") %>%
+  dplyr::select(sid, everything()) %>%
+  group_by(sid) 
+
+### Count points 
+count_points <- 
+  count_data %>%
+  # Keep only relevant columns
+  dplyr::select(sid, geometry, data_type) %>%
+  distinct() %>%
+  group_by(sid, data_type) %>%
+  summarise(
+    # Based on conversations with Sean, even though coordinates for the same sid fluctuate by a few hundred meters 
+    # each year, it is appropriate to treat them as the same reach of the stream so hence centriod method 
+    geometry = st_centroid(st_union(geometry))       
+  ) %>%
+  ungroup() %>%
+  group_by(sid) %>%
+  st_centroid()
+
+# Load Excel data once
+all_occupancy <- read.csv(file = "Data/occupancy_nc.csv") %>%
+  filter(
+    !is.na(Start_LONG), !is.na(Start_LAT)
+  ) %>%
+  mutate(
+    Date = mdy(Date),
+    Occupied = str_detect(Species_Pr, "BKT") & !str_detect(Species_Pr, "EXTIRPATED_BKT"),
+    data_type = "Occupancy",
+    year = year(Date),
+    Stream_Width = as.numeric(Stream_Width),
+    Elevation = as.numeric(Elevation),
+    Water_Temp = as.numeric(Water_Temp),
+    Conductivity = as.numeric(Conductivity),
+    pH = as.numeric(pH),
+    Visibility = as.numeric(Visibility),
+    Time = as.numeric(Time)
+  ) %>%
+  group_by(Start_LONG, Start_LAT) %>%
+  mutate(sid = cur_group_id(),
+         sid = sid + max(count_points$sid)) %>% # To avoid overlap between sid for binary and count data 
+  ungroup() 
+
+# Create occupancy data for all years
+occupancy_data <- map_dfr(years, function(t) {
+  all_occupancy %>%
+    filter(year == t) %>%
+    rowwise() %>%
+    st_as_sf(coords = c("Start_LONG", "Start_LAT"), crs = 4326) %>%
+    st_transform(crs = 32119) %>%
+    mutate(
+      Distance_S = as.numeric(Distance_S),
+      Area = Distance_S * Stream_Width  # Stream widths and lengths (Distance_S) are estimated
+    ) %>%
+    st_centroid() %>%
+    ungroup()
+}) %>%
+  # Filter for known Areas 
+  filter(!is.na(Area)) %>%
+  # Fix elevations that a above maximum elevation of NC
+  mutate(Elevation=if_else(Elevation>2037, Elevation/3.28084, Elevation))
+
+
+# Final point data
+occupancy_points <- occupancy_data %>%
+  dplyr::select(sid, geometry, data_type) %>%
+  distinct()
+
+###
+### Map Stream Network 
+###
+
+### Read in stream edges 
+edges_raw <-
+  st_read("Data/lsn4.ssn/edges.shp") %>%
+  # Transform to project coordinate system for North Carolina 
+  st_transform(edges, crs = 32119)
+
+### Get centroids of every stream segment 
+prediction_points <-
+  edges_raw %>%
+  st_centroid() %>%
+  mutate(data_type = "Prediction",
+         sid = 1:n()+max(occupancy_points$sid)) %>%
+  dplyr::select(sid, data_type)
+
+
+### Combine points 
+points <-
+  rbind(
+    count_points,
+    occupancy_points,
+    prediction_points
+  ) 
+```
+
+## Extract weather data from Daymet 
+
+```{r, extract weather data from Daymet}
+
+# 1. Transform to WGS84 (Daymet requires lat/lon)
+points_latlon <- st_transform(points, crs = 4326)
+
+# Extract coordinates
+coords <- st_coordinates(points_latlon)
+
+# Add lat/lon as columns (X = lon, Y = lat)
+points_latlon <- bind_cols(points_latlon, tibble(lat = coords[, 2], lont = coords[, 1])) %>%
+  st_drop_geometry()
+
+# 2. Function to extract Daymet data for a site
+get_site_daymet <- function(sid, data_type, lat, lon) {
+  tryCatch({
+    df <- download_daymet(
+      lat = lat,
+      lon = lon,
+      start = 2011,
+      end = 2024,
+      internal = TRUE
+    )$data %>%
+      mutate(sid = sid,
+             data_type = data_type)
+  }, error = function(e) {
+    message(paste("Failed for site:", sid))
+    NULL
+  })
+}
+
+# 3. Download for all sites
+# Set up parallel backend (adjust number of workers as needed) (1 hour with 15 cores)
+plan(multisession, workers = 15)
+Start=Sys.time()
+temp_data_list <- future_pmap(points_latlon, 
+                              ~ get_site_daymet(..1, ..2, ..3, ..4))  # ..1 = sid, ..1 = data_type, ..3 = lat, ..4 = lon
+End=Sys.time()
+difftime(End,Start)
+temp_data <- bind_rows(temp_data_list)
+
+temp_data <- temp_data %>%
+  mutate(
+    # Correct way to parse year + day-of-year
+    date = as.Date(paste(year, yday), format = "%Y %j"),
+    
+    month = month(date),
+    year = year(date),  # ensure consistency
+    
+    season = case_when(
+      month %in% c(6, 7, 8, 9)    ~ "summer", # summer includes September (see Valentine 2024 Global Change Biology)
+      month %in% c(12, 1, 2)      ~ "winter",
+      month %in% c(3, 4, 5)       ~ "spring",
+      TRUE                        ~ NA_character_
+    ),
+    
+    # Assign season year: Dec counts toward next year
+    season_year = case_when(
+      month == 12                  ~ year + 1,
+      month %in% c(1, 2)           ~ year,
+      month %in% c(3, 4, 5)        ~ year,
+      month %in% c(6, 7, 8, 9)     ~ year + 1, # lag 1 year for summer bc sampling in June, temp year t effects abundance in year t+1
+      TRUE                   ~ NA_integer_
+    )
+  )
+
+### Save data
+#save(temp_data, file="Outputs/Daymet_raw.RData")
+
+# 5. Summarize seasonal max temps
+seasonal_max <- temp_data %>%
+  filter(season %in% c("summer", "winter", "spring")) %>%
+  filter(season_year >= 2012, season_year <= 2024) %>%
+  group_by(sid, season, season_year) %>%
+  summarise(max_temp = mean(tmax..deg.c., na.rm = TRUE),
+            prcp = sum(prcp..mm.day., na.rm = TRUE), .groups = "drop") 
+
+# 6. Pivot wider: one row per site/year, with summer and winter temps
+Daymet <- seasonal_max %>%
+  pivot_wider(names_from = season, values_from = c("max_temp", "prcp")) %>%
+  rename(year = season_year) %>% 
+  arrange(sid, year) %>%
+  left_join(points, by="sid") %>%
+  st_as_sf()
+
+# 7. Spring 2024 not released yet. Set to previous years values 
+Daymet <- 
+  Daymet %>%
+  group_by(sid) %>%
+  mutate(across(
+    c(max_temp_spring, max_temp_summer, max_temp_winter,
+      prcp_spring, prcp_summer, prcp_winter),
+    ~ if_else(year == 2024 & is.na(.), .[year == 2023], .),
+    .names = "{.col}"
+  )) %>%
+  # Calculate anomaly covariate as degrees hotter than average at each site  
+  mutate(
+    anomaly_spring = max_temp_spring - mean(max_temp_spring, na.rm = TRUE),
+    anomaly_summer = max_temp_summer - mean(max_temp_summer, na.rm = TRUE),
+    anomaly_winter = max_temp_winter - mean(max_temp_winter, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+### Save data
+save(Daymet, file="Outputs/Daymet.RData")
+
+###
+### Make plot
+###
+
+# 1. Pivot to long format for ggplot
+daymet_long <- Daymet %>%
+  pivot_longer(cols = c(anomaly_spring, anomaly_summer, anomaly_winter),
+               names_to = "season",
+               values_to = "anomaly") %>%
+  mutate(season = recode(season,
+                         anomaly_summer = "Summer",
+                         anomaly_winter = "Winter",
+                         anomaly_spring = "Spring"))
+
+# 2. Spatial plot with facets by year
+ggplot(daymet_long) +
+  geom_sf(aes(color = anomaly), size = 1.2) +
+  scale_color_viridis_c(option = "turbo", name = "Temperature Anomaly (°C)") +
+  facet_grid(season ~ year) +
+  labs(title = "Anomaly Temperatures by Site & Season",
+       subtitle = "Data from Daymet 2012–2024",
+       caption = "Faceted by Year and Season") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 9)
+  )
+```
+
+## Create SSN with both data sources (Count & Occupancy Data)
+
+```{r, Create SSN}
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+###
+### Watershed boundaries 
+###
+
+### Watershed resolution (smaller numbers means more coarse)
+resolution <- 8
+
+### our study area spans three different shapefiles unfortunately 
+watersheds_TN <- 
+  st_read(paste0("Data/watershed_boundaries_TN/WBDHU", resolution, ".shp")) %>%
+  st_transform(edges, crs = 32119)
+
+watersheds_SE <- 
+  st_read(paste0("Data/watershed_boundaries_SE/WBDHU", resolution, ".shp")) %>%
+  st_transform(edges, crs = 32119)
+
+watersheds_ME <- 
+  st_read(paste0("Data/watershed_boundaries_ME/WBDHU", resolution, ".shp")) %>%
+  st_transform(edges, crs = 32119)
+
+# Merge them into one sf object
+watersheds <- 
+  bind_rows(watersheds_TN, watersheds_SE, watersheds_ME)
+
+# Find which watershed polygons intersect with stream segments
+intersections <- st_intersects(watersheds, edges_raw)
+
+# Keep only polygons that intersect at least one stream segment
+watersheds <- 
+  watersheds[lengths(intersections) > 0, ] %>%
+  rename(huc=paste0("huc", resolution))
+
+###
+### Assemble SSN
+###
+
+## Get temporary directory, where the example LSN will be stored locally.
+temp_dir <- tempdir()
+
+## Build the LSN (40 seconds)
+Start=Sys.time()
+edges <- lines_to_lsn(
+streams = edges_raw,
+lsn_path = temp_dir,
+check_topology = TRUE,
+overwrite = TRUE,
+verbose = FALSE,
+use_parallel = TRUE,
+no_cores = 10
+) 
+End=Sys.time()
+difftime(End,Start) 
+
+## Incorporate observed sites in LSN (~5 minutes)
+Start=Sys.time()
+obs <- sites_to_lsn(
+sites = points,
+edges = edges,
+save_local = FALSE,
+snap_tolerance = 200, ## in meters because crs=32119
+overwrite = FALSE,
+verbose = FALSE
+) 
+End=Sys.time()
+difftime(End,Start) 
+
+## Calculate upstream distances for sites 
+obs <-
+updist_sites(
+sites=list(obs=obs),
+edges=edges,
+length_col="Length",
+lsn_path = temp_dir,
+save_local = FALSE,
+  overwrite = TRUE
+) %>%
+  pluck("obs") %>%
+  left_join(
+    dplyr::select(st_drop_geometry(edges), "rid", "afvArea"), 
+    by="rid"
+  )
+
+## Assemble SSN Object 
+Start=Sys.time()
+ssn.object <-
+  ssn_assemble(
+    edges=edges,
+    lsn_path=temp_dir,
+    obs_sites=obs,
+    ssn_path="Outputs/nc.ssn",
+    afv_col="afvArea",
+    overwrite=TRUE
+  )
+End=Sys.time()
+difftime(End,Start) 
+
+###
+### Merge sites that have snapped to the same location 
+### 
+
+# Keep only the first row for each unique geometry
+ssn.object$obs <- ssn.object$obs %>%
+  group_by(geometry) %>%
+  slice(1) %>%
+  ungroup()
+
+###
+### Augment count and occupancy data with stream network information 
+###
+
+## Occupancy Data
+occupancy_data <- 
+  st_drop_geometry(occupancy_data) %>%
+  left_join(
+    ssn.object$obs, by=c("sid", "data_type")
+  ) %>%
+  st_as_sf() %>%
+  mutate(
+    Occupied=factor(Occupied, levels=c(TRUE,FALSE))
+  )
+
+## Count Data
+count_data <- 
+  st_drop_geometry(count_data) %>%
+  left_join(
+    ssn.object$obs, by=c("sid", "data_type")
+  ) %>%
+  st_as_sf()
+
+## Barriers Data
+barriers_data <-
+  st_drop_geometry(barriers) %>%
+  left_join(
+    ssn.object$obs, by=c("sid", "data_type")
+  ) %>%
+  st_as_sf()
+
+## Prediction Data
+prediction_data <-
+  st_drop_geometry(prediction_points) %>%
+  left_join(
+    ssn.object$obs, by=c("sid", "data_type")
+  ) %>%
+  st_as_sf() %>%
+  mutate(
+    year=max(occupancy_data$year)
+  )
+
+```
+
+## Plot a single network
+
+```{r, plot a single network}
+
+
+###
+###
+### Plot a single network 
+###
+###
+
+## Select network for plotting 
+netID_select=c(206)
+
+###
+### Plot North Carolina with bbox  
+### 
+
+# Calculate the bounding box with a buffer
+buffer <- 10000
+bbox <- st_bbox(points)
+bbox[1] <- bbox[1] - buffer  # xmin
+bbox[3] <- bbox[3] + buffer  # xmax
+bbox[2] <- bbox[2] - buffer  # ymin
+bbox[4] <- bbox[4] + buffer  # ymax
+
+# Load North Carolina shapefile
+nc <- 
+  st_read(system.file("shape/nc.shp", package = "sf"), quiet = TRUE)  %>%
+  # Transform to project coordinate system for North Carolina 
+  st_transform(edges, crs = 32119) 
+
+# Convert bbox to an sf polygon in EPSG:32119
+bbox_polygon <- st_as_sfc(bbox) |> 
+  st_as_sf() |> 
+  st_set_crs(32119)
+
+inset_state <- 
+  ggplot() +
+  
+  # North Carolina Shapefile
+  geom_sf(data = nc, fill = "grey", color = "white") + #covered by watershed use one or the other not both. 
+  
+  # Bounding box 
+  geom_sf(data = bbox_polygon, fill = NA, color = "black", linewidth = 1.1, linetype = "dashed") +
+  
+  # Add scale bar (use `dist_unit = "km"` for kilometers)
+  annotation_scale(location = "bl", 
+                   width_hint = 0.3, 
+                   line_width = 1, 
+                   text_cex = 0.8) +
+  
+  # Add north arrow
+  annotation_north_arrow(location = "tl",
+                         which_north = "true",
+                         style = north_arrow_fancy_orienteering(),
+                         height = unit(1, "cm"), 
+                         width = unit(1, "cm"),
+                         # manually place using x/y and justification
+                         pad_x = unit(0.5, "cm"),
+                         pad_y = unit(0.5, "cm")) +
+  
+  theme_bw()  +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+
+###
+### Plot of overall stream network in North Carolina with Counties 
+### 
+
+# Clip the watersheds map to the buffered bounding box
+watersheds_clipped <- st_crop(watersheds, bbox)
+
+# Get binding box of watershed 
+bbox_watershed <- st_bbox(filter(ssn.object$edges, netID == netID_select)) %>%
+  st_as_sfc() %>%
+  st_sf()
+
+inset_big <- 
+  ggplot() +
+  
+  # watersheds shapefile 
+  geom_sf(data = watersheds_clipped, fill = "gray90", color = "black", size = 0.2) +
+
+  # Occupancy points (drawn first — underneath)
+  geom_sf(data = mutate(filter(occupancy_points, data_type == "Occupancy"), 
+                        data_type = recode(data_type, "Occupancy" = "Presence/Absence")),
+          aes(shape = data_type, size = data_type, fill = data_type, color = data_type)) +
+
+  # Count points (drawn second — on top)
+  geom_sf(data = filter(count_points, data_type == "Count"),
+          aes(shape = data_type, size = data_type, fill = data_type, color = data_type)) +
+
+  # Bounding box around watershed
+  geom_sf(data = bbox_watershed, fill = NA, color = "black", linewidth = 1.1, linetype = "dashed") +
+
+  # Manual scales (unified legend)
+  scale_shape_manual(name = "Data Type",
+                     values = c("Count" = 16, "Presence/Absence" = 23)) +
+  scale_size_manual(name = "Data Type",
+                    values = c("Count" = 3, "Presence/Absence" = 1.5)) +
+  scale_color_manual(name = "Data Type",
+                     values = c("Count" = "bisque4", "Presence/Absence" = "bisque2")) +
+  scale_fill_manual(name = "Data Type",
+                    values = c("Count" = "bisque4", "Presence/Absence" = "bisque2")) +
+
+  theme_bw() +
+  theme(legend.position = c(0.20,0.8),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+###
+### Main plot
+###
+
+# Plot
+main_plot <-
+ggplot() +
+  # Stream edges
+  geom_sf(data = filter(ssn.object$edges, netID == netID_select),
+          fill = "lightblue", color = "lightblue", size = 0.3) +
+  
+  # Occupancy points with filled diamonds
+  geom_sf(data = filter(occupancy_data, netID == netID_select),
+          aes(fill = Occupied),
+          shape = 23, color = "black", stroke = 0, size=2.4) +
+
+  # Count points with color gradient (viridis)
+  geom_sf(data = filter(count_data, netID == netID_select),
+          aes(color = log(density)),
+          shape = 16, size=4) +
+
+  # Viridis color scale for abundance
+  scale_color_viridis_c(name = "log(Density)", option = "D") +
+
+  # Manual fill colors for Occupied TRUE/FALSE
+  scale_fill_manual(values = c("TRUE" = "yellow", "FALSE" = "black"),
+                    name = "Occupancy",
+                    labels = c("Occupied", "Vacant")) +
+
+  #labs(title = "Stream Network with Sampled Points") +
+  theme_bw() +
+  theme(legend.position = c(0.97,0.10),
+        plot.margin = margin(0.2, 0.2, 0.4, 0.2, "cm")) + # or increase top/right/bottom/left
+  facet_wrap(~ year) +
+  # Make color legend symbols bigger  
+  guides(fill = guide_legend(override.aes = list(size = 5), direction="vertical")) 
+
+## Full plot with inset (cowplot) 
+single_network_inset_nc <- ggdraw() +
+  draw_plot(main_plot, width=0.9) +  # the main map
+  draw_plot(
+    inset_big,
+    x = 0.235, y = -0.02,     # x and y position of lower-left corner (in [0,1])
+    width = 0.33, height = 0.33,  # width and height of inset (in [0,1])
+    scale = 0.92
+  ) + # inset of fine-scale spatial patterns 
+  draw_plot(
+    inset_state,
+    x = 0.54, y = 0.00,     # x and y position of lower-left corner (in [0,1])
+    width = 0.3, height = 0.3,  # width and height of inset (in [0,1])
+    scale = 0.95
+  ) # large scale spatial location 
+
+
+ggsave(plot=single_network_inset_nc, 
+       filename="Figures/single_network_inset_nc_206.png",  
+       dpi=200, height=14, width=16)
+
+```
+
+
+## Format data for input into stan
+
+```{r, format data for input into stan}
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+###
+### Calculate stream matrices 
+###
+
+## networks with at least min_locs locations 
+min_locs=20
+
+netIDs_counts <-
+  ssn.object$obs %>%
+  filter(data_type != "Prediction") %>%
+  pluck("netID") %>%
+  table() 
+
+netIDs <-
+  which(netIDs_counts>min_locs) %>%
+  names()
+
+#ssn.object$obs <- filter(ssn.object$obs, pid!="128")
+
+## Get list of stream distance matrices for observations (~1 min)
+ssn_create_distmat(
+  ssn.object,
+  among_predpts = FALSE,
+  overwrite = TRUE
+)
+
+## Get list of stream distance matrices for observations
+dist_obs <- 
+  ssn_get_stream_distmat(ssn.object, name="obs")
+
+## Only keep a select few
+keep_idx=which(names(dist_obs) %in% paste("dist.net", netIDs, sep=""))
+
+dist_obs <- dist_obs[keep_idx]
+
+## Get hydrologic distances 
+D <- map(dist_obs, 
+         ~.x + t(.x))
+
+# Set really small distances to 200 meter (snapping tolerance) 
+D <- 
+  replace_low_off_diagonals(D, 200)
+
+## Calculate covariance matrices (tail-down) 
+eta_COV <- 
+map(D, function(D) {
+    # Compute weight matrix
+    W <- 1 / D
+    diag(W) <- 0  # Set diagonal to 0
+
+    # Compute R and correlation matrix
+    R <- diag(rowSums(W))
+    corr <- solve(R - 0.999 * W)
+
+    return(corr)
+  })
+
+pids <- D %>%
+  map(colnames) %>%
+  unlist() %>%
+  c()
+
+## Get hydrologic weights for stream networks (list) 
+netIDs <- as.integer(str_remove(names(D), "dist.net")) ## Lists need to match so get order of D matrices 
+
+
+###
+### Arrange observation and get covariates 
+### 
+
+### load in Daymet data
+load(file="Outputs/Daymet.RData")
+
+all_data <-
+  rbind(
+    dplyr::select(occupancy_data, sid, year, data_type),
+    dplyr::select(count_data, sid, year, data_type),
+    dplyr::select(prediction_data, sid, year, data_type)
+  ) %>%
+  # Connect site ids with river ids 
+  left_join(
+    st_drop_geometry(dplyr::select(ssn.object$obs, sid, rid, pid, netID)), by=c("sid")
+  ) %>%
+  # Get river information
+  left_join(
+    st_drop_geometry(dplyr::select(ssn.object$edges, rid, SLOPE, LENGTHKM, AreaSqKM, MAXELEVSMO, StreamOrde)), by=c("rid")
+  ) %>%
+  # Get Daymet information 
+  left_join(
+    st_drop_geometry(Daymet), by=c("sid", "year", "data_type")
+  ) %>%
+  # Filter for networks with the minimum # of observations
+  filter(netID %in% netIDs) %>%
+  # Fix on outlier in slope 
+  mutate(
+    SLOPE=if_else(SLOPE<(-2000), 0, SLOPE) 
+    ) %>%
+  # intersect with watershed ploygons 
+  st_intersection(watersheds) %>%
+  # create watershed id
+  mutate(wid=as.integer(huc))
+
+# Turn wid into a factor variable 
+wids <- sort(unique(all_data$wid))
+all_data <-
+  all_data %>%
+  mutate(wid=factor(wid, levels = wids)) 
+  
+### Subset covariate data
+cov_data <- 
+  all_data %>%
+  # scale covariates 
+  mutate(
+    SLOPE=scale(SLOPE),
+    StreamOrde=scale(StreamOrde),
+    MAXELEVSMO=scale(MAXELEVSMO), ## elevation for stream segment
+    prcp_spring=scale(prcp_spring),
+    prcp_winter=scale(prcp_winter),
+    max_summer=scale(max_temp_summer),
+    anomaly_summer=scale(anomaly_summer),
+    # Set to factors to make sure they match D 
+    netID=factor(netID, levels=netIDs)
+  ) %>%
+  # select columns
+  dplyr::select(pid, year, 
+                SLOPE, 
+                StreamOrde,
+                MAXELEVSMO, 
+                prcp_spring,
+                prcp_winter,
+                max_summer,
+                anomaly_summer) %>%
+  distinct()
+
+###
+### Calculate ICAR Matrix based on watersheds 
+###
+
+### See which polygons are adjacent 
+neighbors <- 
+  watersheds %>%
+  filter(huc %in% all_data$huc) %>%
+  left_join(distinct(dplyr::select(st_drop_geometry(all_data), huc, wid)), by = "huc") %>%
+  st_set_precision(1e2) %>% ## Need this line to join watersheds that appear adjacent but geometry is off 
+  st_make_valid() %>%
+  arrange(wid) %>%
+  st_touches()
+  
+### Build adjacency matrix 
+n_zeta <- nrow(neighbors)
+
+# Create adjacency matrix (binary: 1 if touching, 0 otherwise)
+A <- matrix(0, nrow = n_zeta, ncol = n_zeta)
+for (i in seq_along(neighbors)) {
+  A[i, neighbors[[i]]] <- 1
+}
+
+## Number of sites 
+n <- length(unique(all_data$pid))
+
+## Number of years 
+T <- length(unique(all_data$year))
+
+##
+## Covariates (abundance) 
+##
+
+## Number of covariates 
+p_X <- ncol(cov_data) - 3 + 1 
+
+## Make array with rows observations, columns variable, and slices years 
+X <- array(0, dim=c(T, n, p_X)) 
+idx_i=1
+for(i in pids){
+  tmp1=filter(cov_data, pid==i)
+  X[,idx_i,1]=1
+  X[,idx_i,2]=mean(tmp1$SLOPE, na.rm=TRUE)
+  X[,idx_i,3]=mean(tmp1$StreamOrde, na.rm=TRUE)
+  X[,idx_i,4]=mean(tmp1$MAXELEVSMO, na.rm=TRUE)
+  for(t in unique(tmp1$year)){
+    tmp2=filter(tmp1, year==t)
+    idx_t=t-min(cov_data$year)+1
+    X[idx_t,idx_i,5]=mean(tmp2$prcp_spring)
+    X[idx_t,idx_i,6]=mean(tmp2$prcp_winter)
+    X[idx_t,idx_i,7]=mean(tmp2$max_summer)
+    X[idx_t,idx_i,8]=mean(tmp2$anomaly_summer)
+  }
+  idx_i=idx_i+1
+}
+
+## Number of covariates 
+p_H <- 2
+
+## Make array with rows observations, columns variable, and slices years 
+H <- array(0, dim=c(T, n, p_H)) 
+idx_i=1
+for(i in pids){
+  tmp1=filter(cov_data, pid==i)
+  for(t in unique(tmp1$year)){
+    tmp2=filter(tmp1, year==t)
+    H[t-min(cov_data$year)+1,idx_i,1]=1
+    H[t-min(cov_data$year)+1,idx_i,2]=tmp2$SLOPE[1]
+  }
+  idx_i=idx_i+1
+}
+
+# Set NA for covariates to 0 (mean after centering)
+X[is.na(X)] <- 0
+H[is.na(H)] <- 0
+
+###
+### Data Preparation (Abundance)
+###
+
+## J number of passes (count)
+J_y <- 5
+
+## Matrix for storage of counts 
+y <- array(NA, dim=c(n, J_y, T))
+
+## Matrix for storage of count Area sampled 
+A_y <- matrix(NA, nrow=n, ncol=T)
+
+## Extract y (deplete counts)
+count_obs <- 
+  all_data %>%
+  st_drop_geometry() %>%
+  filter(data_type=="Count") %>%
+  left_join(
+    st_drop_geometry(count_data), by=c("sid", "year", "data_type", "pid")
+  ) %>%
+  filter(!is.na(Area))
+
+## Fill in depletion counts 
+idx_i=1
+for(i in pids){
+  tmp1=filter(count_obs, pid==i)
+  for(t in unique(tmp1$year)){
+    tmp2 <- 
+      tmp1 %>%
+      filter(year==t) 
+    y[idx_i,,t-min(cov_data$year)+1] <-
+      tmp2 %>%
+      dplyr::select(Pass_1:Pass_5) %>%
+      as.matrix() %>%
+      .[1, ] # If there are multiple surveys in a year this take the first one 
+             # technically shouldn't need the [1] but it appears that in a few cases there were multiple occasions
+    A_y[idx_i,t-min(cov_data$year)+1] <-
+      tmp2$Area[1]/1000 # /1000 for numerical stability see Lucy Journal of applied ecology paper 
+  }
+  idx_i=idx_i+1
+}
+
+# Initialize lists of matrices
+N_deplete <- array(0, dim=c(n, J_y, T))
+
+# Calculate fish caught up to this occasion 
+for (j in 2:J_y) {
+  for (t in 1:T) {
+      N_deplete[, j, t] = rowSums(as.matrix(y[, 1:(j - 1), t]), na.rm=TRUE)
+  }
+}
+
+# total fish caught per site year 
+y_sum <-
+  apply(y, c(1,3), sum, na.rm=TRUE)
+
+## Choose a good truncation limit for each site
+# Preallocate result matrix
+N_max <- matrix(0, nrow =  n, ncol = T)
+
+# Fill matrix: loop over years and extract the relevant slice for J_y
+for (t in 1:T) {
+  lambda <- (N_deplete[, J_y, t] + 1) / 0.5
+  N_max[, t] <- qpois(0.9999, lambda, lower.tail = TRUE)
+}
+
+## Histogram 
+hist(y[y>0])
+
+###
+### Data Preparation (presence/absence)
+###
+
+
+## Matrix for storage of presence/absence 
+z <- matrix(NA, nrow=n, ncol=T)
+
+## Matrix for storage of presence/absence Area sampled 
+A_z <- matrix(NA, nrow=n, ncol=T)
+
+## Extract z (presence/absence)
+occupancy_obs <- 
+  all_data %>%
+  st_drop_geometry() %>%
+  filter(data_type=="Occupancy") %>%
+  left_join(
+    st_drop_geometry(occupancy_data), by=c("sid", "year", "data_type", "pid")
+  ) %>%
+  dplyr::select(sid, pid, year, Occupied, Area) %>%
+  distinct() %>%
+  filter(!is.na(Area))
+
+## Fill in occupancy
+idx_i=1
+for(i in pids){
+  tmp1=filter(occupancy_obs, pid==i)
+  for(t in unique(tmp1$year)){
+    tmp2 <- 
+      tmp1 %>%
+      filter(year==t)
+    z[idx_i,t-min(cov_data$year)+1] <-
+      as.logical(tmp2$Occupied[1])
+    A_z[idx_i,t-min(cov_data$year)+1] <-
+      tmp2$Area[1]/1000 ## technically shouldn't need the [1] but it appears that in a few cases there were multiple occasions
+  }
+  idx_i=idx_i+1
+}
+
+
+##
+## Reformat data for stan
+##
+
+# Number of watersheds and indices 
+Q <- length(D)
+n_q <- D %>%
+  map_dbl(nrow)
+q_idx <- rep(1:length(n_q), n_q)
+zeta_idx <- all_data %>%
+  st_drop_geometry() %>%
+  dplyr::select(pid, wid) %>%
+  distinct() %>%
+  mutate(pid=factor(pid, levels = pids),
+         wid=as.integer(wid)) %>%
+  arrange(pid) %>%
+  group_by(pid) %>%
+  summarise(wid=min(wid)) %>%
+  pluck("wid") 
+
+## Calculate raw occupancy rates for each network for making sense of parameters values  
+Occupancy <-
+occupancy_data %>%
+  mutate(netID=factor(netID, levels=netIDs)) %>%
+  # Arrange to match distance and weight matrices 
+  st_drop_geometry() %>%
+  filter(!is.na(netID)) %>%
+  group_by(netID) %>%
+  summarise(Occupancy=mean(as.logical(Occupied), na.rm=TRUE))
+
+## Calculate raw counts for each network for making sense of parameters values  
+Density <-
+count_data %>%
+  mutate(netID=factor(netID, levels=netIDs)) %>%
+  filter(!is.na(netID)) %>%
+  st_drop_geometry() %>%
+  group_by(netID) %>%
+  summarise(Density = mean(density, na.rm = TRUE), .groups = "drop") %>%
+  complete(netID = factor(netIDs, levels = netIDs), fill = list(Density = 0))
+
+## Check raw data correlates positives 
+cor(Density$Density, Occupancy$Occupancy)
+
+###
+### Flatten data for efficient storage & computation in stan 
+###
+
+
+# ---- Depletion model (y) ----
+y_flat <- c()
+N_deplete_flat <- c()
+N_max_flat <- c()
+y_sum_flat <- c()
+A_y_flat <- c()
+y_site_idx <- c()
+y_year_idx <- c()
+J_y_flat <- c()
+X_y_flat <- matrix(NA, 0, p_X)
+H_y_flat <- matrix(NA, 0, p_H)
+
+
+for (i in 1:n) {
+  for (t in 1:T) {
+    # Covariate Matrices 
+    if (sum(!is.na(y[i,,t])) > 0) {
+      X_y_flat <- rbind(X_y_flat, X[t,i, ])
+      H_y_flat <- rbind(H_y_flat, H[t,i, ])
+      A_y_flat <- c(A_y_flat, A_y[i, t])
+      N_max_flat <- c(N_max_flat, N_max[i,t])
+      y_sum_flat <- c(y_sum_flat, sum(y[i,,t], na.rm=TRUE))
+      y_site_idx <- c(y_site_idx, i)
+      y_year_idx <- c(y_year_idx, t)
+      J_y_flat <- c(J_y_flat, sum(!is.na(y[i,,t])))
+    }
+    for (j in 1:J_y) {
+      if (!is.na(y[i, j, t])) {
+        # Depletion 
+        y_flat <- c(y_flat, y[i, j, t])
+        N_deplete_flat <- c(N_deplete_flat, N_deplete[i, j, t])
+      }
+    }
+  }
+}
+
+## Calculate start idx of each site x year 
+y_idx  <- cumsum(c(1, J_y_flat))[1:length(J_y_flat)]-1
+
+z_flat <- c()
+A_z_flat <- c()
+z_site_idx <- c()
+z_year_idx <- c()
+X_z_flat <- matrix(NA, 0, p_X)
+H_z_flat <- matrix(NA, 0, p_H)
+
+for (i in 1:n) {
+  for (t in 1:T) {
+    if (!is.na(z[i, t])) {
+      z_flat <- c(z_flat, z[i, t])*1.0
+      A_z_flat <- c(A_z_flat, A_z[i, t])
+      z_site_idx <- c(z_site_idx, i)
+      z_year_idx <- c(z_year_idx, t)
+      X_z_flat <- rbind(X_z_flat, X[t,i, ])
+      H_z_flat <- rbind(H_z_flat, H[t,i, ])
+    }
+  }
+}
+
+summary(glm(z_flat~X_z_flat-1, family="binomial"))
+summary(MASS::glm.nb(z_flat~X_z_flat-1))
+
+###
+### Finalized Data List for stan
+###
+
+data <- list(
+  # Dimensions
+  n = n,
+  T = T,
+  Q = Q,
+  p_X = p_X,
+  p_H = p_H,
+  n_zeta = n_zeta,
+  
+  # Watershed matrices and indices  
+  A = A,
+  D = D,
+  eta_COV = eta_COV,
+  n_q = c(table(q_idx)),
+  q_idx = q_idx,
+  zeta_idx = zeta_idx,
+  
+  # ---- Depletion model ----
+  y = y,
+  n_y = length(y_sum_flat),
+  n_y_all = length(y_flat),
+  y_flat = y_flat,
+  y_sum_flat = y_sum_flat,
+  N_deplete_flat = N_deplete_flat,
+  N_max_flat = N_max_flat,
+  A_y_flat = A_y_flat,
+  y_site_idx = y_site_idx,
+  y_year_idx = y_year_idx,
+  J_y_flat = J_y_flat,
+  y_idx = y_idx,
+  X_y_flat = X_y_flat,
+  H_y_flat = H_y_flat,
+
+  # ---- Presence model ----
+  n_z = length(z_flat),
+  z_flat = z_flat,
+  A_z_flat = A_z_flat,
+  z_site_idx = z_site_idx,
+  z_year_idx = z_year_idx,
+  X_z_flat = X_z_flat,
+  
+  # ---- covariates for extracting scale factor ----
+  cov_data = cov_data,
+  all_data = all_data
+
+)
+
+###
+### Summarise Distribution of covariates by data source
+###
+
+data$all_data %>%
+  # select relevant columns
+  dplyr::select(pid, data_type, year, 
+                SLOPE, 
+                StreamOrde,
+                MAXELEVSMO, 
+                prcp_spring,
+                prcp_winter,
+                max_temp_summer,
+                anomaly_summer) %>%
+  distinct() %>%
+  # group by data types 
+  group_by(data_type) %>%
+  summarise(across(SLOPE:anomaly_summer, 
+                   list(min = ~min(.x, na.rm = TRUE),
+                        max = ~max(.x, na.rm = TRUE))))
+  
+
+save(data, file="Outputs/data.RData")
+```
+
+
+
+
+# Fit brook trout model (can skip to here if "data" is created)
+
+## Fit geometric IDM (hard coded)
+
+```{r, fit model reals data}
+
+### Load algorithms for fitting
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+source("algorithms/MCMC.R")
+
+### Number MCMC iterations 
+n_mcmc = 2e4
+
+### Fit Models in parallel 
+fit_list <- fit_models_real_parallel(n_mcmc = n_mcmc, 
+                                     c_1 = 0.7, 
+                                     n_cores = 3)
+
+### Save output 
+#save(fit_list, file="Outputs/fit_list.RData")
+
+###
+### Inspect fit 
+###
+
+### 
+### Acceptance rate
+###
+
+# Compute and plot N_acc / n_mcmc for each model type
+walk(fit_list[1:2], ~ hist(.x$N_acc / ncol(.x$N),
+                          main = paste("N_acc / n_mcmc:", deparse(substitute(.x))),
+                          xlab = "Acceptance Rate"))
+
+# Extract rho_acc / n_mcmc for each model type
+rho_acc_rates <- map_dbl(fit_list[1:3], ~ .x$rho_acc / length(.x$rho))
+print(rho_acc_rates)
+
+# Extract rho_acc / n_mcmc for each model type
+phi_acc_rates <- map_dbl(fit_list[1:3], ~ min(.x$phi_acc) / length(.x$rho))
+print(phi_acc_rates)
+
+###
+### Traceplots
+###
+
+### Hyperparameters
+model_fits <- fit_list[1:3]
+n_keep <- 1000
+sample_idx <- seq(from = 1, to = n_mcmc, length.out = n_keep)
+burnin <- 10
+
+# beta (abundance regression)
+beta_df <- extract_trace_df(model_fits, "beta", rows = 2:5)
+plot_trace_df(beta_df, burnin)
+
+# gamma (detection regression)
+gamma_df <- extract_trace_df(model_fits[-3], "gamma", rows = 1:2)
+plot_trace_df(gamma_df, burnin)
+
+# zeta (watershed RE)
+zeta_df <- extract_trace_df(model_fits, "zeta", rows = 1:4)
+plot_trace_df(zeta_df, burnin)
+
+# sigma2_zeta
+sigma2_zeta_df <- extract_scalar_trace_df(model_fits, "sigma2_zeta")
+plot_trace_df(sigma2_zeta_df, burnin)
+
+# xi (temporal RE)
+xi_df <- extract_trace_df(model_fits, "xi", rows = 1:4)
+plot_trace_df(xi_df, burnin)
+
+# sigma2_xi
+sigma2_xi_df <- extract_scalar_trace_df(model_fits, "sigma2_xi")
+plot_trace_df(sigma2_xi_df, burnin)
+
+# eta (spatial RE tail-down)
+eta_df <- extract_trace_df(model_fits, "eta", rows = 1:4)
+plot_trace_df(eta_df, burnin)
+
+# sigma2_eta
+sigma2_eta_df <- extract_trace_df(model_fits, "sigma2_eta", rows = 6:8)
+plot_trace_df(sigma2_eta_df, burnin)
+
+# rho (temporal auto-correlation)
+rho_df <- extract_scalar_trace_df(model_fits, "rho")
+plot_trace_df(rho_df, burnin)
+
+# phi (spatial range)
+phi_df <- extract_trace_df(model_fits, "phi", rows = 1:5)
+plot_trace_df(phi_df, burnin)
+
+### Abundance 
+N_df <- extract_trace_df(model_fits[-3], "N", rows = 1:4)
+plot_trace_df(N_df, burnin)
+
+### Imputted mean abundance 
+log_lambda_df <- extract_log_lambda_means(model_fits)
+
+### histograms
+ggplot(log_lambda_df, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~ model, scales = "free_y") +
+  theme_minimal() +
+  labs(x = "Mean log(λ)", y = "Count", title = "Predicted Log Density by Model")
+
+### density plot
+ggplot(log_lambda_df, aes(x = value, color = model, fill = model)) +
+  geom_density(alpha = 0.3) +
+  theme_minimal() +
+  labs(
+    x = "Mean log(λ)", 
+    y = "Density", 
+    title = "Predicted Log Density by Model"
+  )
+```
+
+## Fit Poisson IDM (stan)
+
+```{r, fit model reals data}
+
+### Load data
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load("Outputs/data.RData")
+stan_data <- data
+
+### Nix some large objects 
+stan_data$cov_data <- NULL
+stan_data$all_data <- NULL
+stan_data$eta_COV <- NULL
+stan_data$y <- NULL
+  
+### Indices
+site_idx <- c(data$z_site_idx, data$y_site_idx)
+
+### Dimensions
+site_levels <- sort(unique(site_idx))
+n <- length(site_levels)
+
+### Matrices
+D <- bdiag(stan_data$D)
+D <- as.matrix(D[site_levels, site_levels])
+zeta_COV <- solve(diag(rowSums(data$A)) - 0.999 * data$A)
+
+### Redefine some objects 
+stan_data$D <- D
+stan_data$zeta_COV <- zeta_COV
+stan_data$n <- n
+stan_data$q_idx <- data$q_idx[site_levels]
+stan_data$zeta_idx <- data$zeta_idx[site_levels]
+stan_data$n_q <- table(stan_data$q_idx)
+stan_data$z_site_idx <- as.integer(factor(data$z_site_idx, levels = site_levels))
+stan_data$y_site_idx <- as.integer(factor(data$y_site_idx, levels = site_levels))
+
+# Compile the model
+mod <- cmdstan_model("algorithms/IDM.stan")
+
+# Run Pathfinder
+pathfinder_fit <- mod$pathfinder(
+  data = stan_data,
+  num_paths = 1
+)
+
+
+# Extract good initial values
+init_list <- pathfinder_fit$draws(format = "list")
+load(file="Outputs/init_list.RData")
+
+###
+### Fit HMC (estimated run time over 1 month!)
+###
+
+trout_HMC <- mod$sample(
+  data = stan_data,
+  chains = 3,
+  parallel_chains = 3,
+  iter_warmup = 200,
+  iter_sampling = 1000,
+  init = init_list,
+  refresh = 1
+)
+
+### Load fit
+load(file="Outputs/trout_HMC.RData")
+
+### summary
+trout_HMC$summary(variables = c("sigma2_eta", "sigma2_zeta", "sigma2_xi", "rho_xi",
+                               "gamma","beta", "xi", "zeta"))
+
+# extract draws
+draws <- as_draws_array(trout_HMC$draws(
+  variables = c("sigma2_eta", "sigma2_zeta", "sigma2_xi", "rho_xi",
+                "gamma", "beta", "xi", "zeta")
+))
+
+# Output 
+#save(trout_HMC, file="Outputs/trout_HMC.RData")
+
+
+###
+### Traceplots
+###
+
+pars <- c("sigma2_eta", "sigma2_zeta", "sigma2_xi", "rho_xi",
+          paste0("gamma[", 1:2, "]"), paste0("beta[", 1:10, "]"))
+
+# loop and make separate traceplots
+for (p in pars) {
+  print(mcmc_trace(draws, pars = p) + ggplot2::ggtitle(p))
+}
+
+###
+### Fit VI 
+###
+
+trout_VI <- mod$variational(
+  data = stan_data,
+  init = init_list,
+  algorithm = "meanfield",
+  iter = 1e6
+)
+
+# Check everything converged  
+trout_VI$summary(variables = c("phi","sigma2_eta", "sigma2_zeta", "sigma2_xi", "rho_xi",
+                               "gamma","beta", "xi", "zeta"))
+
+# Histogram of predicted log density 
+hist(trout_VI$summary(variables = c("log_lambda"))$mean) # Count sites
+hist(trout_VI$summary(variables = c("log_prob"))$mean) # Presence/absence sites
+
+# Output 
+save(trout_VI, file="Outputs/trout_VI.RData")
+```
+
+# Plotting (covariate associations and species spatial intensity, can skip here "data" and "fit_list" available)
+
+## Posterior Prediction of Intensity 
+
+```{r, Extract prediction points for presence analysis }
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+### Load data & model fit 
+load(file="Outputs/data.RData")
+load(file="Outputs/fit_list.RData")
+
+### Choose network
+netID_select <- 206
+
+### Get network index 
+q_idx <- which(str_detect(names(data$D), paste(netID_select)))
+D <- data$D[[q_idx]]
+
+### Extract all pids 
+pids <- data$D %>%
+  map(colnames) %>%
+  unlist() %>%
+  c()
+
+### Filter full dataset for specific network 
+all_data <-
+  # Filter data for only Prediction sites 
+  data$all_data %>%
+  filter(netID == netID_select)
+
+# Figure out which eta (spatial random effects are in the network)
+site_idx <- unique(c(data$z_site_idx, data$y_site_idx))
+q_idx_obs <- data$q_idx[site_idx]
+eta_idx <- which(q_idx_obs==q_idx)
+
+##
+## Covariance matrices
+##
+
+# Get index of which sites are prediction 
+pred_idx <- which(colnames(D) %in% filter(data$all_data, 
+                                                data_type=="Prediction",
+                                                netID == netID_select
+                                                )$pid)
+pred_pids <- colnames(D)[pred_idx]
+n_pred <- length(pred_idx)
+
+# Watershed indices
+zeta_idx <-
+  data$all_data %>%
+  filter(data_type == "Prediction",
+         netID == netID_select) %>%
+  dplyr::select(pid, wid) %>%
+  distinct() %>%
+  mutate(pid = factor(pid, levels=as.integer(pids))) %>%
+  arrange(pid) %>%
+  pluck("wid") %>%
+  as.integer()
+
+##
+## Covariates matrices
+##
+
+## Number of covariates 
+p_X <- 8
+
+## Make array with rows observations, columns variable, and slices years 
+X_pred <- array(0, dim=c(T, n_pred, p_X)) 
+idx_i=1
+for(i in pred_pids){
+  tmp1 <- filter(data$cov_data, pid == i)
+  X_pred[, idx_i, 1] <- 1
+  X_pred[, idx_i, 2] <- mean(tmp1$SLOPE, na.rm=TRUE)
+  X_pred[, idx_i, 3] <- mean(tmp1$StreamOrde, na.rm=TRUE)
+  X_pred[, idx_i, 4] <- mean(tmp1$MAXELEVSMO, na.rm=TRUE)
+  for(t in unique(tmp1$year)){
+    tmp2 <- filter(tmp1, year == t)
+    idx_t <- t - min(data$cov_data$year) + 1
+    X_pred[idx_t, idx_i, 5]  <- mean(tmp2$prcp_spring)
+    X_pred[idx_t, idx_i, 6]  <- mean(tmp2$prcp_winter)
+    X_pred[idx_t, idx_i, 7]  <- mean(tmp2$max_summer)
+    X_pred[idx_t, idx_i, 8]  <- mean(tmp2$anomaly_summer)
+  }
+  idx_i <- idx_i + 1
+}
+
+###
+### Calculate Intensity via Krigging 
+###
+
+### Extract model fit 
+PG_joint_out <- fit_list$PG_joint_out
+n_mcmc <- ncol(PG_joint_out$beta)
+phi <- PG_joint_out$phi[q_idx,]
+sigma2_eta <- PG_joint_out$sigma2_eta[q_idx,]
+n_samples <- 100
+thin_seq <- floor(seq(from=1000, to=n_mcmc, length.out=n_samples))
+log_lambda_pred <- array(NA, dim=c(T, n_pred, n_samples))
+eta_all_array <- array(NA, dim=c(ncol(eta_COV), n_samples))
+
+for(l in 1:n_samples){
+  
+  # Calculate full exponential covariance matrix
+  eta_COV <- sigma2_eta[thin_seq[l]] * exp( -D / phi[thin_seq[l]] )
+
+  # Partition matrices 
+  eta_COV_pp <- eta_COV[pred_idx, pred_idx]
+  eta_COV_oo <- eta_COV[-pred_idx, -pred_idx]
+  eta_COV_po <- eta_COV[pred_idx, -pred_idx]
+
+  # Krigging matrices 
+  mean_mat <- eta_COV_po %*% solve(eta_COV_oo)
+  var_mat <- eta_COV_pp - eta_COV_po %*% solve(eta_COV_oo) %*% t(eta_COV_po)
+
+  # Effects per site
+  eta_all_array[-pred_idx,l] <- PG_joint_out$eta[eta_idx, thin_seq[l]]
+  eta_all_array[pred_idx,l] <- 
+  eta_pred <- 
+    rmvn(1,
+        mu=mean_mat %*% PG_joint_out$eta[eta_idx, thin_seq[l]],
+        sigma=var_mat)
+  site_pred <- PG_joint_out$zeta[zeta_idx, thin_seq[l]] + eta_pred
+  
+  for(t in 1:T){
+    log_lambda_pred[t,,l] <- 
+      X_pred[t,,] %*% PG_joint_out$beta[,thin_seq[l]] +
+      PG_joint_out$xi[t,thin_seq[l]] +
+      site_pred 
+  }
+  
+  ### Timer
+  if (l %% 10 == 0) cat(l, " ")
+}
+
+### Create tibble with mean intensity 
+intensity_pred <- 
+  tibble(
+    # sites and years 
+    pid=rep(as.integer(pred_pids), each=T),
+    year=rep(years, n_pred),
+    # Stream level spatial effect
+    eta_mean=rep(apply(eta_all_array[pred_idx,], 1, mean, na.rm=TRUE), each=T),
+    eta_sd=rep(apply(eta_all_array[pred_idx,], 1, sd, na.rm=TRUE), each=T),
+    # Full linear predictor
+    log_lambda_mean=c(apply(log_lambda_pred, c(1,2), mean, na.rm=TRUE)),
+    log_lambda_sd=c(apply(log_lambda_pred, c(1,2), sd, na.rm=TRUE))
+  ) %>%
+  left_join(
+    data$all_data, by=c("pid", "year")
+  )
+
+### Create tibble with mean intensity 
+eta_all <- 
+  tibble(
+    # sites and years 
+    pid=rep(as.integer(colnames(eta_COV)), each=T),
+    year=rep(years, ncol(eta_COV)),
+    # Stream level spatial effect
+    eta_mean=rep(apply(eta_all_array, 1, mean, na.rm=TRUE), each=T),
+    eta_sd=rep(apply(eta_all_array, 1, sd, na.rm=TRUE), each=T),
+  ) %>%
+  left_join(
+    data$all_data, by=c("pid", "year")
+  ) %>%
+  filter(
+    !is.na(sid)
+  ) %>%
+  st_as_sf()
+
+ggplot(eta_all) +
+  # Prediction sites: smaller points
+  geom_sf(data = filter(eta_all, data_type == "Prediction"),
+          aes(color = eta_mean),
+          size = 1, shape = 16) +
+  # Non-Prediction sites: bigger or different shape
+  geom_sf(data = filter(eta_all, data_type != "Prediction"),
+          aes(color = eta_mean),
+          size = 3, shape = 17) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(color = expression(eta[mean]),
+       title = "Spatial distribution of eta_mean",
+       x = "Longitude", y = "Latitude")
+
+save(intensity_pred, file="Outputs/intensity_pred.RData")
+```
+
+## Plot Intensity 
+
+```{r, plot a single network}
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+load(file="Outputs/fit_list.RData")
+
+### load outputs & ssn
+load(file="Outputs/intensity_pred.RData")
+ssn.object <- ssn_import(path="Outputs/nc.ssn", overwrite = TRUE)
+
+### Select network for plotting 
+netID_select=c(206)
+
+### Add predicted densities to river edges (do it spatially because some rid not in predicted list)
+
+# Ensure both are sf objects and in the same CRS
+edges_sf <- ssn.object$edges %>%
+  filter(netID == netID_select) %>%
+  st_transform(4326)  # or match CRS of intensity_pred
+
+intensity_pred_sf <- intensity_pred %>%
+  st_as_sf() %>%
+  st_transform(st_crs(edges_sf))
+
+# Find index of nearest intensity_pred point for each edge
+nearest_idx <- st_nearest_feature(edges_sf, intensity_pred_sf)
+
+# Add new key column 
+edges_sf$pid <- intensity_pred$pid[nearest_idx]
+
+# Add intensity_pred attributes to edges
+intensity_pred_sf <-
+  intensity_pred_sf %>%
+  st_drop_geometry() %>%
+  left_join(
+    edges_sf, by="pid", keep=FALSE
+  ) %>%
+  st_as_sf(sf_column_name="geometry")
+
+### Extract presence/absence points 
+presence_data <-
+  ssn.object$obs %>%
+  filter(data_type == "Occupancy",
+         netID == netID_select) %>%
+  left_join(
+    st_drop_geometry(occupancy_data)
+  ) %>%
+  mutate(
+    Occupied=as.logical(Occupied),
+    Occupied_mean=if_else(Occupied, max(intensity_pred$log_lambda_mean)/10, min(intensity_pred$log_lambda_mean))
+  )
+
+### Extract count data
+count_data <-
+  ssn.object$obs %>%
+  filter(data_type == "Count",
+         netID == netID_select) %>%
+  left_join(
+    st_drop_geometry(count_data)
+  ) 
+
+
+###
+###
+### Plot a single network 
+###
+###
+
+###
+### Density
+###
+
+# Define the first five years (adjust as needed)
+select_years <- 2024
+
+# Plot with DEM as background
+mean_plot <- 
+  ggplot() +
+  
+  # Stream edges filtered for first five years
+  geom_sf(data = intensity_pred_sf %>% filter(year %in% select_years),
+          aes(color = log_lambda_mean, linewidth = StreamOrde.x),
+          inherit.aes = FALSE) +
+  
+  # Presence data filtered
+  geom_sf(data = presence_data,
+          aes(fill = Occupied, shape = data_type),
+          shape = 23, stroke = 0, size = 2.4, inherit.aes = FALSE) +
+  
+  # Count data filtered
+  geom_sf(data = count_data,
+          aes(color = log(density)),
+          shape = 16, size = 4, inherit.aes = FALSE) +
+    
+  scale_fill_manual(
+    name = "Occupied",
+    values = c("FALSE" = "black", "TRUE"= "yellow")
+  ) +
+  
+  scale_color_viridis_c(name = "log(density)", option = "E") +
+  
+  guides(linewidth = "none", fill = "none") +
+  
+  scale_linewidth(range = c(0.7, 2.5), guide = "none") +
+  
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    panel.background = element_rect(fill = "white", color = NA),  # <-- set panel to white
+    plot.background = element_rect(fill = "white", color = NA)    # <-- set plot to white
+  ) 
+
+###
+### sd(Density)
+###
+
+
+# Plot with DEM as background
+sd_plot <- 
+  ggplot() +
+  
+  # Stream edges filtered for first five years
+  geom_sf(data = intensity_pred_sf %>% filter(year %in% select_years),
+          aes(color = log_lambda_sd, linewidth = StreamOrde.x),
+          inherit.aes = FALSE) +
+  
+  scale_color_viridis_c(name = "sd(log(density))", option = "E") +
+  
+  # Remove linewidth legend
+  guides(linewidth = "none") +
+  
+  # Remove Elevation legend
+  guides(fill = "none") +
+  
+  scale_linewidth(range = c(0.7, 2.5), guide = "none") +
+  
+
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    panel.background = element_rect(fill = "white", color = NA),  # <-- set panel to white
+    plot.background = element_rect(fill = "white", color = NA)    # <-- set plot to white
+  )
+
+###
+### Plot together 
+###
+
+
+combined_plot <- mean_plot + sd_plot +
+  plot_layout(ncol = 2)
+
+ggsave(plot = combined_plot,
+       filename = "Figures/combined_predicted_density_netID_206.png",
+       dpi = 300, height = 8, width = 13)
+```
+
+
+
+## Plot Posteriors Real Data Fit
+
+```{r, Plot Posteriors Real Data Fit}
+
+###
+### Load model fits
+###
+
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/fit_list.RData")
+load(file="Outputs/Data.RData")
+
+PG_joint_out=fit_list$PG_joint_out
+PG_binary_out=fit_list$PG_binary_out
+PG_count_out=fit_list$PG_count_out
+
+###
+### Convert posterior samples to tidy format
+###
+
+# count + presence/absence
+beta_joint_df <- as.data.frame(t(PG_joint_out$beta)) %>%
+  mutate(iter = row_number()) %>%
+  pivot_longer(cols = starts_with("V"), names_to = "beta", values_to = "value") %>%
+  mutate(beta = paste0("beta[", as.integer(str_remove(beta, "V")), "]"),
+         `Data Sources` = "count & presence/absence") 
+  
+
+# presence/absence
+beta_presence_df <- as.data.frame(t(PG_binary_out$beta)) %>%
+  mutate(iter = row_number()) %>%
+  pivot_longer(cols = starts_with("V"), names_to = "beta", values_to = "value") %>%
+  mutate(beta = paste0("beta[", as.integer(str_remove(beta, "V")), "]"),
+        `Data Sources` = "presence/absence")
+
+# count
+beta_count_df <- as.data.frame(t(PG_count_out$beta)) %>%
+  mutate(iter = row_number()) %>%
+  pivot_longer(cols = starts_with("V"), names_to = "beta", values_to = "value") %>%
+  mutate(beta = paste0("beta[", as.integer(str_remove(beta, "V")), "]"),
+        `Data Sources` = "count")
+
+
+# Combine
+posterior_df <- 
+  bind_rows(
+    beta_joint_df, 
+    beta_presence_df, 
+    beta_count_df
+    ) %>%
+  mutate(
+    name=case_when(
+      beta == "beta[1]" ~ "Intercept",
+      beta == "beta[2]" ~ "Slope",
+      beta == "beta[3]" ~ "Stream Order",
+      beta == "beta[4]" ~ "Elevation",
+      beta == "beta[5]" ~ "Precipitation Spring",
+      beta == "beta[6]" ~ "Precipitation Winter",
+      beta == "beta[7]" ~ "Temperature Summer",
+      beta == "beta[8]" ~ "Temperature Anomaly",
+    ),
+    name = factor(name, levels=c("Intercept", "Slope", "Watershed Size", "Elevation", "Stream Order",
+                                 "Precipitation Spring", "Precipitation Winter", "Temperature Summer", 
+                                 "Temperature Anomaly")),
+    type=if_else(name %in% 
+                   c("Precipitation Spring", "Precipitation Winter", "Temperature Summer", "Temperature Anomaly"),
+                 "Temporal",
+                 "Static"
+    )
+    )
+
+# Make ggridges plot
+beta_ridges <-
+posterior_df %>%
+  filter(name != "Intercept") %>%
+  mutate(name = ifelse(name != "Intercept",
+                       gsub(" ", "\n", name),
+                       name)) %>%
+  ggplot(aes(x = value, y = name, fill = `Data Sources`)) +
+  geom_density_ridges(alpha = 0.7, 
+                      scale = 1,
+                      bandwidth = 0.07) +  # increased from 0.07
+  labs(x = NULL, y = NULL, fill = "Data Sources") +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = wes_palette("AsteroidCity1", 3, type = "discrete")) +
+  theme(
+    legend.position = "bottom",
+  ) +
+  facet_wrap(~type, scales = "free")
+
+### Save plot 
+ggsave(beta_ridges, 
+       file="Figures/beta_ridges.png",
+       width=8,
+       height=4)
+
+
+```
+
+
+# Assess model fit (RPS)
+
+```{r, Assess model fit (RPS)}
+
+###
+### Load model fits
+###
+
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/fit_list.RData")
+load(file="Outputs/Data.RData")
+load(file="Outputs/trout_VI.RData")
+source("algorithms/MCMC.R")
+
+### Extract model fit 
+PG_joint_out=fit_list$PG_joint_out
+
+###
+### Extract total fish count for each site and presence/absence
+###
+
+z <- data$z_flat
+n_z <- length(z)
+
+###
+### PPD (Geometric IDM)
+###
+
+burnin <- 1000
+samples <- 1000
+thin_seq <- seq(from=burnin, to=ncol(PG_joint_out$log_lambda[-c(1:n_z),]), length.out=samples)
+psi <- logit_inv(PG_joint_out$log_lambda[-c(1:n_z),thin_seq])
+
+### Extract probability of occupancy for presence/absence sites
+psi_z <- logit_inv(PG_joint_out$log_lambda[1:n_z,thin_seq])
+z_GR <-
+  rbinom(
+    n_z * samples,
+    size = 1,
+    prob = psi_z
+  )
+
+###
+### PPD (Poisson IDM)
+###
+
+### Extract probability of occupancy for presence/absence sites
+log_prob <- 
+  trout_VI$draws("log_prob") %>%
+  t() 
+prob <- 1-exp(-exp(log_prob))
+z_VI <-
+  rbinom(
+    n_z * samples,
+    size = 1,
+    prob = prob
+  )
+
+###
+### Ranked Probability Score (presence/absence, simplifies to RMSE)
+###
+
+## gIDM
+GR_RPS <- apply(psi_z, 2, function(x) (z-x)^2)
+GR_site <- apply(GR_RPS, 1, mean)
+
+## VI
+VI_RPS <- apply(prob, 2, function(x) (z-x)^2)
+VI_site <- apply(VI_RPS, 1, mean)
+
+###
+### Calculate Time Required to Obtain 1000 Independent Samples
+###
+
+GR <- 1000 / (mean(apply(PG_joint_out$beta[,-c(1:burnin)], 1, mcmcse::ess)) / fit_list$time[1]) 
+VI <- as.vector(trout_VI$time()$total) / 60  # Time in seconds 
+
+
+# Function to summarize each matrix
+mean_sd_format <- function(vector) {
+  sprintf("%.2f (%.2f)", mean(vector), sd(vector))
+}
+
+# Create a data frame for the table
+summary_df <- rbind(
+  VI = mean(VI_site),
+  #HMC = mean_sd_format(beta_HMC),
+  GR = mean(GR_site)
+) %>%
+  cbind(
+    round(c(VI, GR))
+  )
+
+# Assign column names
+colnames(summary_df) <- c("Ranked Probability Score", "Time")
+
+# Convert to xtable and print
+latex_table <- xtable(summary_df, align = "lcc")
+print(latex_table, sanitize.text.function = identity)
+```
+
+# Simulation study in parallel (geostatistical model)
+
+## Sample size (n) varying
+
+```{r, simulation study in parallel (n)}
+
+###
+### Simulate dataset
+###
+
+# Set parameters
+p <- 5
+v_prop <- 0.8
+n_values <- c(100, 200, 300, 500, 1000)
+
+# Repeat each n value 100 times for total 300 simulations
+n_list <- rep(n_values, each = 100)
+
+# Define wrapper for your simulation function
+simulate_wrapper <- function(n) {
+  simulate_data(n = n, v_prop = v_prop, p = p)
+}
+
+# Define packages used 
+packages_list <-
+  c("Boom", "tidyverse", "cmdstanr", "posterior")
+
+
+# Register parallel backend
+n_cores <- parallel::detectCores() - 1  # leave one core free
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Run simulations in parallel
+data_list <- foreach(n = n_list, .packages = packages_list) %dopar% {
+  simulate_wrapper(n)
+}
+
+# Stop the cluster
+stopCluster(cl)
+
+# Label datasets
+for(i in 1:length(n_list)){
+  data_list[[i]]$dataset=i
+}
+
+# Check distribution of simulated values 
+hist(map_dbl(data_list, ~.$phi))
+hist(map_dbl(data_list, ~.$sigma2))
+
+###
+### Fit models in parallel
+###
+
+# Data list & Functions
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/Data_list_p5.RData")
+source("algorithms/MCMC.R")
+
+# Define parameters
+iter_sampling <- 1000
+iter_warmup <- 200
+n_mcmc <- 1200
+burnin <- 200
+VI_iter <- 5e4
+VI_draws <- 1e3
+
+# Register parallel backend
+n_cores <- 8  # leave one core free
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Timing 
+start <- Sys.time()
+
+# Run model fitting in parallel across all datasets in data_list
+metrics <- foreach(data = data_list,
+                   .combine = rbind,
+                   .packages = packages_list,
+                   .export = "fit_models",
+                   .errorhandling = "remove") %dopar% {
+
+  fit_models(
+    data,
+    iter_sampling, iter_warmup, chains=1,
+    n_mcmc, burnin,
+    VI_iter, VI_draws,
+    Models = c("gIDM", "VI")
+  )
+                   }
+
+finish <- Sys.time()
+difftime(finish, start)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Check result
+glimpse(metrics)
+
+# Quick summary 
+metrics %>%
+  group_by(Model) %>%
+  summarise(across(time:ess_lambda, mean, na.rm=TRUE)) 
+
+# Save output
+save(metrics, file="Outputs/metrics_p5.RData")
+```
+
+### Plot Simulation Results 
+
+```{r, plot simulation results}
+
+###
+### Load data
+###
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/metrics_p5.RData")
+load(file="Outputs/Data_list_p5.RData")
+
+
+### Bind select outputs from datasets 
+data_tibble <-
+  map_df(data_list, ~
+           tibble(
+             n=.x$n,
+             dataset=.x$dataset,
+             phi=.x$phi,
+             sigma2=.x$sigma2
+           ))
+
+### Reshape data to long format
+metrics_long <- metrics %>%
+  left_join(data_tibble, by = "dataset") %>%
+  # Calculate time required in seconds to acquire 1000 independent samples (100 / ESR)
+  mutate(
+    ess_beta_rate = log10(1000 / (ess_beta / time)),
+    ess_lambda_rate = log10(1000 / (ess_lambda / time))
+  ) %>%
+  pivot_longer(
+    cols = c(cov_beta, cov_lambda,
+             bias_beta, bias_lambda,
+             sd_beta, sd_lambda,
+             ess_beta_rate, ess_lambda_rate),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric_type = case_when(
+      grepl("^cov_", metric) ~ "Coverage",
+      grepl("^bias_", metric) ~ "Bias",
+      grepl("^sd_", metric) ~ "Variability",
+      grepl("^ess_.*_rate$", metric) ~ "log(Time)"
+    ),
+    metric_type = factor(metric_type, levels = c("Coverage", "Bias", "Variability", "log(Time)")),
+    param = case_when(
+      grepl("beta", metric) ~ "beta",
+      grepl("lambda", metric) ~ "lambda"
+    ),
+    #Model = factor(Model, levels = c("HMC", "GR", "PG", "VI", "VI(mf)"))
+  ) %>%
+  filter(n %in% c(100, 500, 1000)) %>%
+  mutate(Model = factor(Model, levels=c("HMC", "gIDM", "VI")))
+
+
+### Calculate limit of boxplots 
+limits <- metrics_long %>%
+  group_by(metric_type, param, n) %>%
+  summarise(
+    lower = quantile(value, 0.05, na.rm = TRUE),
+    upper = quantile(value, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+### Remove outliers 
+metrics_trimmed <- metrics_long %>%
+  left_join(limits, by = c("metric_type", "n", "param")) %>%
+  filter(value >= lower, value <= upper) 
+
+### Boxplot of results (beta)
+beta_plot <- metrics_trimmed %>%
+  filter(param == "beta", !is.na(Model)) %>%
+  ggplot(aes(x = Model, y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_grid2(
+    metric_type ~ n,
+    scales = "free_y",
+    labeller = label_bquote(cols = n == .(n))  
+  ) +
+  scale_fill_manual(values = wes_palette("AsteroidCity1", 3, type = "discrete")) + 
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = expression(bold(beta)),
+    fill = element_blank()
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+### Boxplot of results (lambda)
+lambda_plot <-
+metrics_trimmed %>%
+  filter(param == "lambda",
+         !is.na(Model)) %>%
+  ggplot(aes(x = Model, y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_grid2(
+    metric_type ~ n,
+    labeller = label_bquote(cols = n == .(n)),  
+    scales = "free_y"#,
+    #independent = "y"
+  ) +
+  scale_fill_manual(values = wes_palette("AsteroidCity1", 3, type = "discrete")) + 
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = expression(log(bold(lambda))),
+    fill = element_blank()
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+### Combine plots 
+simulation_plot <- 
+  grid.arrange(
+    beta_plot,
+    lambda_plot,
+    ncol = 2
+  )
+
+### Save plots 
+ggsave(simulation_plot, 
+       file="Figures/simulation_plot_n.png",
+       width=12,
+       height=6)
+
+```
+
+
+## Overdispersion (nu) varying 
+
+```{r, simulation study in parallel (nu)}
+
+###
+### Simulate datasets (sample size (n) varying)
+###
+
+# Set parameters
+n <- 500
+p <- 5
+z_prop <- 0.8
+nu_values <- c(1, 10, 100)
+
+# Define packages used 
+packages_list <-
+  c("Boom", "tidyverse", "cmdstanr", "posterior")
+
+# Repeat each n value 100 times for total 300 simulations
+nu_list <- rep(nu_values, each = 100)
+
+# Define wrapper for your simulation function
+simulate_wrapper <- function(nu) {
+  simulate_data(n = n, z_prop = z_prop, p = p, nu = nu)
+}
+
+# Register parallel backend
+n_cores <- 8
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Run simulations in parallel
+data_list <- foreach(nu = nu_list, .packages = packages_list) %dopar% {
+  simulate_wrapper(nu)
+}
+
+# Stop the cluster
+stopCluster(cl)
+
+# Label datasets
+for(i in 1:length(nu_list)){
+  data_list[[i]]$dataset=i
+}
+
+# Check distribution of simulated values 
+hist(map_dbl(data_list, ~log(sd(.$N))))
+
+# Save datasets 
+# save(data_list, file="Outputs/Data_list_p5_n500_nu.RData")
+
+
+###
+### Fit models in parallel
+###
+
+# Data list & Functions
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/Data_list_p5_n100_nu.RData")
+source("algorithms/MCMC.R")
+
+# Define parameters
+iter_sampling <- 1000
+iter_warmup <- 200
+n_mcmc <- 1200
+burnin <- 200
+VI_iter <- 5e4
+VI_draws <- 1e3
+
+# Register parallel backend
+n_cores <- 10  # leave one core free
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Timing 
+start <- Sys.time()
+
+# Run model fitting in parallel across all datasets in data_list
+metrics <- foreach(data = data_list,
+                   .combine = rbind,
+                   .packages = packages_list,
+                   .export = "fit_models",
+                   .errorhandling = "remove") %dopar% {
+
+  fit_models(
+    data,
+    iter_sampling, iter_warmup, chains=1,
+    n_mcmc, burnin,
+    VI_iter, VI_draws,
+    Models = c("gIDM", "HMC", "VI")
+  )
+                   }
+
+finish <- Sys.time()
+difftime(finish, start)
+
+# Stop the cluster
+stopCluster(cl)
+
+# Check result
+glimpse(metrics)
+
+# Quick summary 
+metrics %>%
+  group_by(nu, Model) %>%
+  summarise(across(time:rejection, mean, na.rm=TRUE)) 
+
+# Save metrics 
+save(metrics, file="Outputs/metrics_p5_n100_nu_II.RData")
+
+```
+
+### Plot Simulation Results 
+
+```{r, plot simulation results}
+
+###
+### Load data
+###
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+load(file="Outputs/metrics_p5_n100_nu.RData")
+load(file="Outputs/Data_list_p5_n100_nu.RData")
+
+
+### Bind select outputs from datasets 
+data_tibble <-
+  map_df(data_list, ~
+           tibble(
+             n=.x$n,
+             dataset=.x$dataset,
+             phi=.x$phi,
+             sigma2=.x$sigma2
+           ))
+
+### Reshape data to long format
+metrics_long <- metrics %>%
+  left_join(data_tibble, by = "dataset") %>%
+  # Calculate time required in seconds to acquire 1000 independent samples (100 / ESR)
+  mutate(
+    ess_beta_rate = log10(1000 / (ess_beta / time)),
+    ess_lambda_rate = log10(1000 / (ess_lambda / time))
+  ) %>%
+  pivot_longer(
+    cols = c(cov_beta, cov_lambda,
+             bias_beta, bias_lambda,
+             sd_beta, sd_lambda,
+             ess_beta_rate, ess_lambda_rate),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric_type = case_when(
+      grepl("^cov_", metric) ~ "Coverage",
+      grepl("^bias_", metric) ~ "Bias",
+      grepl("^sd_", metric) ~ "Variability",
+      grepl("^ess_.*_rate$", metric) ~ "log(Time)"
+    ),
+    metric_type = factor(metric_type, levels = c("Coverage", "Bias", "Variability", "log(Time)")),
+    param = case_when(
+      grepl("beta", metric) ~ "beta",
+      grepl("lambda", metric) ~ "lambda"
+    ),
+    #Model = factor(Model, levels = c("HMC", "GR", "PG", "VI", "VI(mf)"))
+  ) %>%
+  filter(n %in% c(100, 500, 1000)) %>%
+  mutate(Model = factor(Model, levels=c("HMC", "gIDM", "VI")))
+
+
+### Calculate limit of boxplots 
+limits <- metrics_long %>%
+  group_by(metric_type, param, n) %>%
+  summarise(
+    lower = quantile(value, 0.05, na.rm = TRUE),
+    upper = quantile(value, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+### Remove outliers 
+metrics_trimmed <- metrics_long %>%
+  left_join(limits, by = c("metric_type", "n", "param")) %>%
+  filter(value >= lower, value <= upper) 
+
+### Boxplot of results (beta)
+beta_plot <- metrics_trimmed %>%
+  filter(param == "beta", !is.na(Model)) %>%
+  ggplot(aes(x = Model, y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_grid2(
+    metric_type ~ nu,
+    scales = "free_y",
+    labeller = label_bquote(cols = nu == .(nu))  
+  ) +
+  scale_fill_manual(values = wes_palette("AsteroidCity1", 3, type = "discrete")) + 
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = expression(bold(beta)),
+    fill = element_blank()
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+### Boxplot of results (lambda)
+lambda_plot <-
+metrics_trimmed %>%
+  filter(param == "lambda",
+         !is.na(Model)) %>%
+  ggplot(aes(x = Model, y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_grid2(
+    metric_type ~ nu,
+    labeller = label_bquote(cols = nu == .(nu)),  
+    scales = "free_y"#,
+    #independent = "y"
+  ) +
+  scale_fill_manual(values = wes_palette("AsteroidCity1", 3, type = "discrete")) + 
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = expression(log(bold(lambda))),
+    fill = element_blank()
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+### Combine plots 
+simulation_plot <- 
+  grid.arrange(
+    beta_plot,
+    lambda_plot,
+    ncol = 2
+  )
+
+### Save plots 
+ggsave(simulation_plot, 
+       file="Figures/simulation_plot_nu.png",
+       width=12,
+       height=6)
+
+```
+
+
+# Data preparation for American robin analysis (this chunk is adapted from IDS1_CaseStudy.R at https://zenodo.org/records/10666980)
+
+```{r, Prepare data}
+
+### Set directory 
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/Kery_2024")
+
+# Load data ----
+# Distance Sampling (DS) data from Oregon2020
+head(DS <- read.table("data/amro_obsdetection.csv",header=T,sep=";",as.is = T))
+DS$Distance <- DS$Distance/1000 # Convert to km
+
+# Table including covariates and Oregon2020 counts (particularly the zeros) 
+head(sitecovs <- read.table("data/amro_sitecovs_simplified.csv",header=T,sep=";",as.is = T))
+
+# eBird
+head(PC <- read.table("data/amro_ebird_simplified.csv",header=T,sep=";",as.is = T))
+
+# Link DS and zero observations (from sitecovs)
+names(sitecovs)[names(sitecovs) == "Latitude.x"] <- "Latitude" # Homogenize names
+names(sitecovs)[names(sitecovs) == "Longitude.x"] <- "Longitude"
+nondetections <- sitecovs[sitecovs$Count==0,] # Select zero counts
+nondetections <- nondetections[,names(nondetections) %in% names(DS)] # Columns from nondetection data that are not in DS can be removed
+nondetections[,names(DS)[!names(DS) %in% names(nondetections)]] <- NA # Add columns to nondetection data that are in DS only 
+DS <- rbind(DS,nondetections) # combine
+
+# Site as factor level
+DS$site <- as.numeric(as.factor(DS$Location_ID))
+
+# Arrange by Site ID
+DS <- 
+  DS %>%
+  arrange(site) %>%
+  left_join(
+    sitecovs, by="Location_ID"
+  )
+
+# Define new truncation distance (B) for the DS data set 
+newB <- 0.3 # in km
+
+# Replace observations with greater distances than truncation distance with NA
+DS$Distance[DS$Distance>newB] <- NA
+sum(is.na(DS$Distance))
+
+# Site ID of each non-missing observation
+siteDS <- DS$site[!is.na(DS$Distance)]
+
+# Either the truncation distance for eBird, 
+# or large enough distance to be unlimited for species of interest (like maximum detection distance) 
+fullDistance <- 0.5 # in km
+
+# Distance bin width for rectangle approximation of integral
+# approximation to the detection probability at each point
+delta <- 0.05 # in km
+
+# Compute the areas associated with the count data for each site
+(A_DS <- pi * newB^2 )
+(A_PC <- pi * fullDistance^2 )
+
+# Number of sites per data set
+nsites_DS <- length(unique(DS$site))      # Data set 1
+nsites_PC <- length(unique(apply(PC[,c("latitude.x","longitude.x")],1,paste,collapse="_")))      # PC data
+
+# Filter for unique covariate values
+cov <-
+  DS %>%
+  dplyr::select("site",
+                "Year.x",
+                "Elevation_mean315", "CanopyCover_315",
+                "CanopyCover_165", "DevelopedMediumIntensity_165", "DevelopedHighIntensity_165") %>%
+  distinct()
+
+# values to scale covariate data
+mean.elev <- mean(c(PC$Elevation_mean315, cov$Elevation_mean315))
+sd.elev <- sd(c(PC$Elevation_mean315, cov$Elevation_mean315))
+
+#
+# Scale and join covariates 
+#
+
+# Abundance process
+years <- c(cov$Year.x, PC$year) - 10
+habitat <- (c(PC$ConiferCover_315, cov$CanopyCover_315) - 50) / 100
+elev <- (c(PC$Elevation_mean315, cov$Elevation_mean315) - mean.elev) / sd.elev
+
+# detectability
+cancovdetect = (( cov$CanopyCover_165) - 50 ) / 100
+urbandetect = (( cov$DevelopedMediumIntensity_165 + cov$DevelopedHighIntensity_165) - 50 ) / 100
+
+###
+### Reformat and rename data for new analysis 
+###
+
+### Total number of sites
+n_N <- nsites_DS
+n_z <- nsites_PC
+n <- n_N + n_z
+ 
+### Abundance design matrix
+X <-
+  cbind(
+    rep(1, n),
+    habitat,
+    habitat^2,
+    elev,
+    elev^2
+  )
+
+### Detection design matrix 
+H <-
+  cbind(
+    rep(1, n_N),
+    cancovdetect,
+    urbandetect
+  )
+
+### Area of each type of site 
+S <- 
+  c(
+    rep(A_PC, n_z),
+    rep(A_DS, n_N)
+  )
+
+### Year of each survey and model matrix
+year_levels <- sort(unique(years))
+year_mat <- model.matrix(~ factor(years, levels = year_levels) - 1)
+
+
+### Priors 
+mu_beta <- numeric(ncol(X))
+Sigma_beta <- diag(2.25^2, ncol(X))
+mu_gamma <- numeric(ncol(H))
+Sigma_gamma <- diag(2.25^2, ncol(H))
+
+### Summarize number of detections per site
+detections <-
+  DS %>%
+  group_by(site) %>%
+  summarise(detections=n()) %>%
+  pluck("detections")
+
+### Visualize detections 
+hist(detections)
+
+### Create matrices of detection and distance 
+M <- 20 # Super population size 
+Y <- matrix(0, M, n_N)
+D <- matrix(NA, M, n_N)
+for(i in 1:n_N){
+  tmp <- filter(DS, site==i & !is.na(Distance))
+  obs <- nrow(tmp)
+  if(obs>0){
+    Y[1:obs,i] <- 1
+    D[1:obs,i] <- tmp$Distance
+  }
+}
+
+### Rename truncation limit 
+u_d <- newB
+
+### Create presence/absence 
+z <- as.numeric(PC$count > 0)
+
+###
+### Check MLEs 
+###
+summary(glm(z ~ X[1:n_z,] - 1, family = "binomial")) # binary data
+summary(glm(PC$count ~ X[1:n_z,] - 1, family = "poisson")) # observed count data (point counts)
+summary(glm(colSums(Y) ~ X[-c(1:n_z),] - 1, family = "poisson")) # number of detections distance sampling 
+summary(glm(colSums(Y) ~ H - 1, family = "poisson")) # number of detections distance sampling 
+  
+```
+
+# Fit models (Kery et al. 2024 data)
+
+## Stage I
+
+```{r, real data fit (Stage I)}
+
+### Load algorithms for fitting
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+source("algorithms/MCMC.R")
+
+### Number MCMC iterations 
+n_mcmc = 10000
+
+### Fit Models in parallel 
+start <- Sys.time()
+ds_I <- 
+  ds_MCMC(
+    # Data
+    Y, D, H, 
+    # Priors 
+    u_d, 
+    mu_gamma, Sigma_gamma,
+    # Hyperparameters 
+    c_1=0.7, n_mcmc)
+end = Sys.time()
+difftime(end, start)
+
+
+### 
+### Acceptance rate
+###
+
+burnin=1000
+ds_I$gamma_acc / n_mcmc
+
+###
+### Traceplots
+###
+
+# gamma (half-normal detection function)
+plot_traceplots(ds_I$gamma, param_names=paste0("gamma[", 1:3, "]"), burnin=burnin)
+
+# abundances 
+idx <- 1:4
+plot_traceplots(ds_I$N[idx,], param_names=paste0("N[", idx, "]"), burnin=burnin)
+hist(rowMeans(ds_I$N))
+```
+
+## Stage II (geometric IDM)
+
+```{r, real data fit (Stage II)}
+
+### Load algorithms for fitting
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+source("algorithms/MCMC.R")
+
+### Load Stage I fit
+load(file="Outputs/ds_I.RData")
+N_I <- ds_I$N[,-c(1:1000)]
+
+### Number MCMC iterations 
+n_mcmc = 10000
+
+### FIt model
+start = Sys.time()
+ds_II <- 
+  ds_II_MCMC(# Data
+    z, N_I, X, S, year_mat,
+    # Priors 
+    mu_beta, Sigma_beta,
+    var_shape=0.001, var_rate=0.001,
+    Poisson=TRUE,
+    # Hyperparameters 
+    n_mcmc)
+end = Sys.time()
+ds_II$time <- difftime(end, start, units = "sec")
+
+
+### 
+### Acceptance rate
+###
+
+burnin <- 1000
+ds_I$gamma_acc / n_mcmc
+
+###
+### Traceplots
+###
+
+# beta (abundance covariates)
+plot_traceplots(ds_II$beta, burnin=burnin)
+
+# abundances (site-level (distance sampling))
+idx <- 1:4
+plot_traceplots(ds_II$N[idx,], param_names=paste0("N[", idx, "]"), burnin=burnin)
+hist(rowMeans(ds_II$N))
+
+# latent density 
+idx <- 1:4
+plot_traceplots(ds_II$log_lambda[idx,], param_names=paste0("log_lambda[", idx, "]"), burnin=burnin)
+
+# xi temporal random effect
+plot_traceplots(ds_II$xi, burnin=burnin)
+
+# tau temporal random effect variance
+plot_traceplots(t(ds_II$tau), burnin=burnin, param_names=c("tau"))
+
+# Save ouput
+#save(ds_II, file="Outputs/ds_II.RData")
+```
+
+## Stage II (Poisson IDM stan)
+
+```{r, real data fit (Stage II, stan)}
+
+### Load algorithms for fitting
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+### Load Stage I fit
+load(file="Outputs/ds_I.RData")
+N_I <- ds_I$N[,-c(1:1000)]
+
+###
+### Converts MCMC samples to probabilities 
+###
+
+# Dimensions
+n_sites <- nrow(N_I)
+n_samples <- ncol(N_I)
+M <- 20  # since counts go from 0 to 20
+
+# Initialize output matrix
+pi <- matrix(0, nrow = n_sites, ncol = M + 1)
+
+# Loop over each possible count
+for (k in 0:M) {
+  pi[, k + 1] <- rowMeans(N_I == k)
+}
+
+# Optional: assign column names for clarity
+colnames(pi) <- paste0("count_", 0:M)
+
+# Compile the model
+mod <- cmdstan_model("algorithms/IDS.stan")
+
+# Data list for Stan
+data_list <- list(
+  n = n,
+  n_z = n_z,
+  n_N = n_N,
+  T = ncol(year_mat),
+  p_X = ncol(X),
+  M = M,
+  z = z,
+  pi = pi,
+  X = X,
+  year_mat = year_mat,
+  S = S
+)
+
+# Run Pathfinder
+pathfinder_fit <- mod$pathfinder(
+  data = data_list,
+  num_paths = 1
+)
+
+# Check everything OK 
+pathfinder_fit$summary()
+
+# Extract good initial values
+init_list <- pathfinder_fit$draws(format = "list")
+
+
+###
+### Fit HMC 
+###
+
+HMC_fit <- mod$sample(
+  data = data_list,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 200,
+  iter_sampling = 1000,
+  seed = 123,
+  init = init_list
+)
+
+# Check everything converged  
+HMC_fit$summary(variables = c("beta", "xi", "tau"))
+
+###
+### Traceplots
+###
+
+# Convert to draws_array format
+draws_array <- as_draws_array(HMC_fit$draws())
+
+# Traceplot for beta
+mcmc_trace(draws_array, pars = vars(contains("beta")))
+
+# Traceplot for xi
+mcmc_trace(draws_array, pars = vars(matches("^xi(\\[|$)")))
+
+# Traceplot for tau
+mcmc_trace(draws_array, pars = vars(contains("tau")))
+
+# Save fit 
+#save(HMC_fit, file="Outputs/HMC_fit.RData")
+
+###
+### Fit Variational Inference  
+###
+
+VI_fit <- mod$variational(
+  data = data_list,
+  algorithm = "meanfield",
+  output_samples = 1000,
+  seed = 123,
+  adapt_engaged = TRUE
+)
+
+# Check everything converged  
+VI_fit$summary(variables = c("beta", "xi", "tau"))
+
+# Save fit 
+#save(VI_fit, file="Outputs/VI_fit.RData")
+```
+
+# Visualize/map American robin density in Oregon
+
+```{r, Visualize/Map American Robin Density in Oregon}
+
+# Set working directory
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+# Load model fit 
+load(file="Outputs/ds_II.RData")
+
+# Load model fit (Kery 2024) & Extract beta
+load(file="Outputs/out5A.RData")
+
+# For adjusting intercepts 
+adj <- mean(as.matrix(out5A$samples)[,16])
+
+# Load model fit (HMC) & Extract beta
+load(file="Outputs/HMC_fit.RData")
+# Extract all draws of 'beta' (all chains)
+beta_draws_array <- HMC_fit$draws(variables = "beta")
+# Convert to a flat matrix: (iterations * chains) × parameters
+beta_matrix <- as_draws_matrix(beta_draws_array)
+# transpose to get (parameters × draws)
+beta_HMC <- t(beta_matrix)
+
+# Load model fit (HMC) & Extract beta
+load(file="Outputs/VI_fit.RData")
+beta_VI <- t(VI_fit$draws(variables = "beta"))
+
+# Load environmental data
+head(centroids <- read.table("Kery_2024/data/env_centroids.csv",header=T,sep=";",as.is = T))
+
+#load in file with desired crs
+polygon.grid <- st_read("Kery_2024/data/geodata/grid_1km.shp")
+
+# mask for study area
+mask <- st_read("Kery_2024/data/geodata/StudyArea.shp")
+
+# adjust variables as they were in the model data
+centroids$cancov.scaled <- (centroids$cancov - 50)/100
+centroids$elev.scaled <- (centroids$elev - mean.elev)/sd.elev
+
+###
+### Create RASTER of median prections 
+###
+
+# Create design matrix prediction 
+n_pred <- nrow(centroids)
+X_pred <-
+  cbind(
+    rep(1, n_pred),
+    centroids$cancov.scaled,
+    centroids$cancov.scaled^2,
+    centroids$elev.scaled, 
+    centroids$elev.scaled^2
+  )
+
+# Extract model output samples as a matrix
+test.raster <- rast(nlyrs=1, crs = crs(vect(polygon.grid)), extent = ext(polygon.grid), resolution = 1000)
+
+### Add intercept adjustment (post-hoc correction for availability)
+ds_II$beta[1,] <- ds_II$beta[1,] + (adj - mean(ds_II$beta[1,]))
+
+### Plot map
+GR.predictions <- apply(ds_II$beta[,-c(1:1000)], 2, function(x) exp(X_pred %*% x)) # Make predictions for each km-square 
+GR.predictions <- cbind(centroids, med=apply(GR.predictions,1,median))
+GR.predictions.output_sf = st_as_sf(GR.predictions, coords = c("X", "Y"), crs = st_crs(polygon.grid))
+GR.predictions.output_rast <- rasterize(vect(GR.predictions.output_sf), test.raster, field = "med")
+GR.predictions.output_rast <- mask(GR.predictions.output_rast, vect(mask)) 
+
+# Plot density map
+plot(
+  GR.predictions.output_rast, 
+  main = "Geometric Regression",
+  col = rev(heat.colors(100))
+)
+
+###
+### Create RASTER of median prections (HMC)
+###
+
+# Extract model output samples as a matrix
+test.raster <- rast(nlyrs=1, crs = crs(vect(polygon.grid)), extent = ext(polygon.grid), resolution = 1000)
+
+### Add intercept adjustment (post-hoc correction for availability)
+beta_HMC[1,] <- beta_HMC[1,] + (adj - mean(beta_HMC[1,]))
+
+### Plot map
+HMC.predictions <- apply(beta_HMC, 2, function(x) exp(X_pred %*% x)) # Make predictions for each km-square 
+HMC.predictions <- cbind(centroids, med=apply(HMC.predictions,1,median))
+HMC.predictions.output_sf = st_as_sf(HMC.predictions, coords = c("X", "Y"), crs = st_crs(polygon.grid))
+HMC.predictions.output_rast <- rasterize(vect(HMC.predictions.output_sf), test.raster, field = "med")
+HMC.predictions.output_rast <- mask(HMC.predictions.output_rast, vect(mask)) 
+
+# Plot density map
+plot(
+  HMC.predictions.output_rast, 
+  main = "Hamiltonian Monte Carlo",
+  col = rev(heat.colors(100))
+)
+
+###
+### Create RASTER of median prections (VI)
+###
+
+# Extract model output samples as a matrix
+test.raster <- rast(nlyrs=1, crs = crs(vect(polygon.grid)), extent = ext(polygon.grid), resolution = 1000)
+
+### Add intercept adjustment (post-hoc correction for availability)
+beta_VI[1,] <- beta_VI[1,] + (adj - mean(beta_VI[1,]))
+
+### Plot map
+VI.predictions <- apply(beta_VI, 2, function(x) exp(X_pred %*% x)) # Make predictions for each km-square 
+VI.predictions <- cbind(centroids, med=apply(VI.predictions,1,median))
+VI.predictions.output_sf = st_as_sf(VI.predictions, coords = c("X", "Y"), crs = st_crs(polygon.grid))
+VI.predictions.output_rast <- rasterize(vect(VI.predictions.output_sf), test.raster, field = "med")
+VI.predictions.output_rast <- mask(VI.predictions.output_rast, vect(mask)) 
+
+# Plot density map
+plot(
+  VI.predictions.output_rast, 
+  main = "Variational Inference",
+  col = rev(heat.colors(100))
+)
+
+###
+### Create RASTER of median predictions (Kery et al. (2024))
+###
+
+# Create a function to make predictions based on model output
+predict.abundances <- function(environmental = environmental, parameters = parameters){
+  prediction <- exp(parameters[1] + parameters[2] * environmental$cancov.scaled + parameters[3] * I(environmental$cancov.scaled^2) + 
+                      parameters[4] * environmental$elev.scaled + parameters[5] * I(environmental$elev.scaled^2))
+  return(prediction)
+}
+
+# Extract model output samples as a matrix
+samples.matrix <- as.matrix(out5A$samples)
+test.raster <- rast(nlyrs=1, crs = crs(vect(polygon.grid)), extent = ext(polygon.grid), resolution = 1000)
+
+### Plot map
+kery.predictions <- apply(samples.matrix[,16:20], 1, FUN = predict.abundances, environmental = centroids) # Make predictions for each km-square and iteration
+kery.predictions <- cbind(centroids, med=apply(kery.predictions,1,median))
+kery.predictions.output_sf = st_as_sf(kery.predictions, coords = c("X", "Y"), crs = st_crs(polygon.grid))
+kery.predictions.output_rast <- rasterize(vect(kery.predictions.output_sf), test.raster, field = "med")
+kery.predictions.output_rast <- mask(kery.predictions.output_rast, vect(mask)) 
+
+plot(
+  kery.predictions.output_rast, 
+  main = "Estimates based on JAGS analysis",
+  col = rev(heat.colors(100))
+)
+
+###
+### Create Map of data
+###
+
+# Convert Wildlife Refuge for plotting
+refuge <-
+  mask %>%
+  st_transform(crs = 4326) %>%
+  st_union()
+
+# Assume refuge is your sf polygon
+bbox_sf <- st_as_sfc(st_bbox(refuge))
+bbox_sf <- st_sf(geometry = bbox_sf)
+
+# Transform refuge to WGS84 (required by get_elev_raster)
+refuge_wgs84 <- st_transform(refuge, crs = 4326)
+
+# Get bounding box as sf object for download extent
+bbox_sf <- st_as_sfc(st_bbox(refuge_wgs84))
+bbox_sf <- st_sf(geometry = bbox_sf)
+
+# Download elevation raster over bounding box (a bit larger than exact shape)
+elev_raster_raw <- get_elev_raster(locations = bbox_sf, z = 10, clip = "bbox")
+
+# Convert to terra SpatRaster
+elev_raster <- rast(elev_raster_raw)
+
+# Reproject refuge to match raster CRS
+refuge_utm <- st_transform(refuge, crs = crs(elev_raster))
+
+# Convert refuge to terra-compatible format
+refuge_vect <- vect(refuge_utm)
+
+# Clip elevation raster to exact refuge shape
+elev_clipped <- crop(elev_raster, refuge_vect)        # crop to bounding box
+elev_clipped <- mask(elev_clipped, refuge_vect)       # mask to exact shape
+
+# Convert to data.frame for plotting
+elev_df <- as.data.frame(elev_clipped, xy = TRUE, na.rm = TRUE) %>%
+  rename(elevation = 3)  # column 3 contains the elevation values
+
+# Convert distance sampling to spatial data frame using Longitude and Latitude
+DS_sf <- DS %>%
+  filter(!is.na(Longitude.x), !is.na(Latitude.x)) %>%  # remove NA coords
+  st_as_sf(coords = c("Longitude.x", "Latitude.x"), crs = 4326) %>% # WGS84
+  dplyr::select("geometry") %>%
+  mutate(data_type="Distance Sampling",
+         model="Data Types") %>%
+  distinct()
+
+# Convert point counts to spatial data frame using Longitude and Latitude
+PC_sf <- PC %>%
+  filter(!is.na(longitude.x), !is.na(latitude.x)) %>%  # remove NA coords
+  st_as_sf(coords = c("longitude.x", "latitude.x"), crs = 4326) %>% # WGS84
+  dplyr::select("geometry") %>%
+  mutate(data_type="Point Counts",
+         model="Data Types") %>%
+  distinct()
+
+# 2. Plot using ggplot2
+data_types <-
+  ggplot() +
+  geom_raster(data = elev_df, aes(x = x, y = y, fill = elevation)) +
+  scale_fill_gradientn(name = "Elevation", colours = rev(heat.colors(100))) +
+  geom_sf(data = DS_sf, aes(color = data_type), size = 0.7, alpha = 0.8) +
+  geom_sf(data = PC_sf, aes(color = data_type), size = 0.7, alpha = 0.8) +
+  theme_bw() +
+  labs(x = NULL, y = NULL) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    plot.margin = margin(0, 0, 0, 0)
+  ) +
+  scale_color_manual(
+    values = c("Distance Sampling" = "black", "Point Counts" = "darkgreen")
+  ) +
+  guides(
+    color = guide_legend(
+      title = NULL,
+      ncol = 2,                          
+      override.aes = list(size = 3)     # bigger points in color legend
+    ),
+    fill = guide_colorbar(
+      title = "Elevation",
+      barwidth = 8,
+      barheight = 0.8
+    )
+) +
+  facet_wrap(~ model)
+  
+###
+### Plot together
+###
+
+# Convert rasters to data frames
+df_kery <- as.data.frame(kery.predictions.output_rast, xy = TRUE, na.rm = TRUE) %>%
+  rename(pred = 3) %>%
+  mutate(model = "Kery et al. (2024)")
+
+df_GR <- as.data.frame(GR.predictions.output_rast, xy = TRUE, na.rm = TRUE) %>%
+  rename(pred = 3) %>%
+  mutate(model = "Geometric IDM")
+
+df_HMC <- as.data.frame(HMC.predictions.output_rast, xy = TRUE, na.rm = TRUE) %>%
+  rename(pred = 3) %>%
+  mutate(model = "Hamiltonian Monte Carlo")
+
+df_VI <- as.data.frame(VI.predictions.output_rast, xy = TRUE, na.rm = TRUE) %>%
+  rename(pred = 3) %>%
+  mutate(model = "Variational Inference")
+
+# Combine into one data frame
+df_combined <- bind_rows(df_kery, df_GR, df_HMC, df_VI)
+
+# Plot
+american_robin_distribution <- 
+ggplot(df_combined, aes(x = x, y = y, fill = pred)) +
+  geom_raster() +
+  facet_wrap(~ model, ncol = 2) +
+  scale_fill_gradientn(name = "Abundance", colours = rev(heat.colors(100))) +
+  coord_equal() +
+  theme_bw() +
+  labs(x = NULL, y = NULL) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text = element_blank(),       # remove axis tick labels
+    axis.ticks = element_blank(),      # remove axis ticks
+    axis.title = element_blank(),       # just in case axis titles remain
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+combined_plot <- plot_grid(
+  data_types,
+  american_robin_distribution,
+  ncol = 2,
+  #rel_widths = c(0.51, 1),  # tweak as needed
+  align = "h",              # aligns the plots horizontally
+  scale = 1,
+  axis = "tb"               # aligns top and bottom axes (optional)
+)
+
+ggsave(plot=combined_plot, 
+       filename="Figures/american_robin_distribution.png",  
+       dpi=300, height=9, width=11)
+
+###
+### Overall estimated abundance
+###
+
+### Estimate abundance throughout study area for each sample
+# Select km-squares within study area 
+within.study.area <- !(is.na(values(centroids.predictions.output_rast)))
+
+# Make predictions for each km-square and iteration
+centroids.predictions <- apply(ds_II$beta[,-c(1:1000)], 2, function(x) exp(X_pred[within.study.area,] %*% x)) # Make predictions for each km-square 
+
+# Summarize population estimates
+pop.estimates <- apply(centroids.predictions, 2, sum)
+
+(mean.pop.estimate <- mean(pop.estimates)) # Mean for the entire study area
+(uci.pop.estimate <- quantile(pop.estimates, probs = 0.975)) # upper
+(lci.pop.estimate <- quantile(pop.estimates, probs = 0.025)) # lower
+
+round(range(apply(centroids.predictions,1,median)),1) # range of median estimates per km-square
+
+# Write raster
+writeRaster(centroids.predictions.output_rast, "IDS_AMRO_PredictedAbundance.tif", filetype = "GTiff", overwrite = TRUE)
+
+```
+# Compare posteriors covariate Effects 
+
+```{r, Compare Posteriors Covariate Effects }
+
+# Set working directory
+setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+
+# Load model fit 
+load(file="Outputs/ds_II.RData")
+beta <- ds_II$beta
+
+# Load model fit (Kery 2024) & Extract beta
+load(file="Outputs/out5A.RData")
+beta_Kery <- t(as.matrix(out5A$samples[,16:20]))
+
+# Load model fit (HMC) & Extract beta
+load(file="Outputs/HMC_fit.RData")
+# Extract all draws of 'beta' (all chains)
+beta_draws_array <- HMC_fit$draws(variables = "beta")
+# Convert to a flat matrix: (iterations * chains) × parameters
+beta_matrix <- as_draws_matrix(beta_draws_array)
+# transpose to get (parameters × draws)
+beta_HMC <- t(beta_matrix)
+
+# Load model fit (HMC) & Extract beta
+load(file="Outputs/VI_fit.RData")
+beta_VI <- t(VI_fit$draws(variables = "beta"))
+
+###
+### Calculate Time Required to Obtain 1000 Independent Samples
+###
+
+GR <- 1000 / (mean(apply(beta, 1, mcmcse::ess)) / as.vector(ds_II$time))
+Kery <- 1000 / (mean(apply(beta_Kery, 1, mcmcse::ess)) / as.vector(out5A$time))
+HMC <- 1000 / (mean(apply(beta_HMC, 1, mcmcse::ess)) / as.vector(HMC_fit$time()$total))
+VI <- as.vector(VI_fit$time()$total)
+
+
+# Function to summarize each matrix
+mean_sd_format <- function(mat) {
+  means <- rowMeans(mat)
+  sds <- apply(mat, 1, sd)
+  sprintf("%.2f (%.2f)", means, sds)
+}
+
+# Create a data frame for the table
+summary_df <- rbind(
+  VI = mean_sd_format(beta_VI),
+  HMC = mean_sd_format(beta_HMC),
+  GR = mean_sd_format(beta),
+  Kery = mean_sd_format(beta_Kery)
+) %>%
+  cbind(
+    round(c(VI, HMC, GR, Kery))
+  )
+
+# Assign column names
+colnames(summary_df) <- c("Intercept", "Canopy", "Canopy^2", "Elevation", "Elevation^2", "Time")
+
+# Convert to xtable and print
+latex_table <- xtable(summary_df, align = "lcccccc")
+print(latex_table, sanitize.text.function = identity)
+```
