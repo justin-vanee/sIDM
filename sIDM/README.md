@@ -1,6 +1,6 @@
 "sIDM_code.Rmd" is the main markdown file for data manipulation, conducting simulation study, and fitting American robin and brook trout integrated distribution models. 
 
-Code for brook trout data manipulation, model fitting, and visualization are provided for review only. Raw data is not provided because of data privacy. Summarized data files for fitting the described integrated distribution model can be provided upon request.
+Code for brook trout data manipulation and visualization are provided for review only. Raw data is not provided because of data privacy. Summarized data files for fitting the described integrated distribution model are in "Outputs"
 
 "algorithms" contains hard-coded MCMC algorithms with Pólya-gamma augmentation and stan files for facilitating model fitting with HMC. These algorithms and files are referenced in "sIDM_code.Rmd"
 
