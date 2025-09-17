@@ -3,7 +3,7 @@ data {
   // ---- Dimensions ----
   int<lower=1> n;                     // number of sites
   int<lower=1> p;                     // number of covariates 
-  int<lower=1> n_v;                   // number of presence/absence sites
+  int<lower=1> n_z;                   // number of presence/absence sites
   int<lower=1> n_N;                   // number of abundance sites
 
   // ---- Matrices ----
@@ -11,7 +11,7 @@ data {
   matrix[n, p] X;                     // covariate matrix 
 
   // ---- Data ----
-  array[n_v]int<lower=0, upper=1> v;  // presence/absence observations 
+  array[n_z]int<lower=0, upper=1> z;  // presence/absence observations 
   array[n_N]int<lower=0> N;           // abundance observations 
   
   // ---- Fixed Parameters ----
@@ -45,16 +45,16 @@ transformed parameters {
   vector[n_N] lambda;
   
   // probability of occupancy 
-  vector[n_v] pi;
+  vector[n_z] pi;
   
   // presence/absence
-  for (i in 1:n_v) {
+  for (i in 1:n_z) {
     pi[i] = 1-exp(-exp(log_lambda[i]));
   }
   
   // abundance 
   for(i in 1:n_N){
-    lambda[i] = exp(log_lambda[i+n_v]);
+    lambda[i] = exp(log_lambda[i+n_z]);
   }
 
 }
@@ -88,8 +88,8 @@ model {
   }
   
   // presence/absence likelihood
-  for (i in 1:n_v) {
-    target += bernoulli_lpmf(v[i] | pi[i]);
+  for (i in 1:n_z) {
+    target += bernoulli_lpmf(z[i] | pi[i]);
   }
   
 

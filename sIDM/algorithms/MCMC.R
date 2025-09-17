@@ -265,16 +265,9 @@ simulate_data <-
     if(is.null(nu)){
       # cloglog link
       prob = 1 - exp(-exp(log_lambda[z_idx]))
-      v = rbinom(n_z, 1, prob)
+      z = rbinom(n_z, 1, prob)
       N = rpois(n_N, exp(log_lambda[-z_idx]))
     } else {
-      # Polson 2013 (NB)
-      #psi = logit_inv(log_lambda)
-      # link function implied by negative binomial model
-      #prob = 1 - (1 - psi[z_idx])^nu
-      #z = rbinom(n_z, 1, prob)
-      # parameterized in terms of probability of failure Polson 2013
-      #N = rnbinom(n_N, size=nu, prob=(1-psi[-z_idx])) 
       # Typical mean parameterization 
       lambda = exp(log_lambda)
       # link function implied by negative binomial model
@@ -312,7 +305,8 @@ fit_models <-
            iter_sampling, iter_warmup, chains=1,
            n_mcmc, burnin,
            VI_iter, VI_draws,
-           Models = c("HMC", "gIDM", "gIDM(proposal)", "VI")) {
+           dir, 
+           Models = c("HMC", "gIDM", "VI")) {
     
     # Create tibble for outputs
     metrics_tib <- tibble::tibble(
@@ -331,11 +325,15 @@ fit_models <-
       nu = data$nu
     ) %>% tibble::column_to_rownames("Model")
     
+    if(is.null(data$nu)){
+      data$nu=NULL
+    }
+    
     
     if ("HMC" %in% Models) {
   
     model <- cmdstan_model(
-      '/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/algorithms/IDM_sim.stan'
+      file.path(dir, "algorithms", "IDM_sim.stan")
     )
   
     fit <- 
@@ -374,13 +372,13 @@ fit_models <-
     
     # Fit Geometric Regression 
     if ("gIDM" %in% Models) {
-      source("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/algorithms/MCMC.R")
+      source(file.path(dir, "algorithms", "MCMC.R"))
       mu_beta <- numeric(data$p)
       Sigma_beta <- diag(1.5^2, data$p)
       
       Start <- Sys.time()
       gIDM_out <- PG_joint_sim(
-        z = data$v, N = data$N, X = data$X, D = data$D,
+        z = data$z, N = data$N, X = data$X, D = data$D,
         mu_beta = mu_beta, Sigma_beta = Sigma_beta,
         Poisson = FALSE, phi = data$phi,
         n_mcmc = n_mcmc
@@ -389,29 +387,12 @@ fit_models <-
       metrics_tib["gIDM", "time"] <- difftime(End, Start, units = "secs")
     }
     
-    # Fit Geometric Regression (proposal)
-    if ("gIDM(proposal)" %in% Models) {
-      source("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/algorithms/MCMC.R")
-      mu_beta <- numeric(data$p)
-      Sigma_beta <- diag(1.5^2, data$p)
-      
-      Start <- Sys.time()
-      gIDM_proposal_out <- PG_joint_sim(
-        z = data$v, N = data$N, X = data$X, D = data$D,
-        mu_beta = mu_beta, Sigma_beta = Sigma_beta,
-        Poisson = TRUE, phi = data$phi,
-        n_mcmc = n_mcmc
-      )
-      End <- Sys.time()
-      metrics_tib["gIDM(proposal)", "time"] <- difftime(End, Start, units = "secs")
-      metrics_tib["gIDM(proposal)", "rejection"] <- mean(gIDM_proposal_out$rejections)
-    }
     
     # Fit VI model (mean field approximation)
     if ("VI" %in% Models) {
       if (!exists("model")) {
         model <- cmdstan_model(
-          '/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/algorithms/IDM_sim.stan'
+          file.path(dir, "algorithms", "IDM_sim.stan")
         )
       }
       
@@ -459,9 +440,6 @@ fit_models <-
       if (model_name == "HMC" && !is.null(HMC_posterior_beta)) {
         beta_post <- HMC_posterior_beta[-1,] # Remove intercept
         lambda_post <- HMC_posterior_log_lambda
-      } else if (model_name == "gIDM(proposal)") {
-        beta_post <- gIDM_proposal_out$beta[-1, thin] # Remove intercept
-        lambda_post <- gIDM_proposal_out$log_lambda[, thin]
       } else if (model_name == "gIDM") {
         beta_post <- gIDM_out$beta[-1, thin] # Remove intercept
         lambda_post <- gIDM_out$log_lambda[, thin]
@@ -507,7 +485,8 @@ fit_models <-
 ## Fit 3 models to real data 
 fit_models_real_parallel <- function(n_mcmc = 2e4, 
                                      c_1 = 0.7, 
-                                     n_cores = 3) {
+                                     n_cores = 3,
+                                     dir) {
   
   ### Packages
   library(tidyverse)
@@ -517,7 +496,7 @@ fit_models_real_parallel <- function(n_mcmc = 2e4,
   library(doParallel)
   
   ### Load data
-  load("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/Outputs/data.RData")
+  load(file.path(dir, "Outputs", "data.RData"))
   
   ### Priors & Hyperparameters
   mu_beta <- numeric(data$p_X)
@@ -544,13 +523,7 @@ fit_models_real_parallel <- function(n_mcmc = 2e4,
   
   ### Matrices
   A <- data$A[watershed_levels, watershed_levels]
-  eta_COV <- bdiag(data$eta_COV)
-  eta_COV <- as.matrix(eta_COV[site_levels, site_levels])
-  D <- data$D %>% 
-    bdiag() %>% 
-    as.matrix() %>% 
-    .[site_levels, site_levels] %>% 
-    blockdiag_to_list(n_q)
+  D <- data$D
   X <- rbind(data$X_z_flat, data$X_y_flat)
   S <- c(data$A_z_flat, data$A_y_flat)
   H <- data$H_y_flat
@@ -573,7 +546,7 @@ fit_models_real_parallel <- function(n_mcmc = 2e4,
   ### Parallel model fitting
   model_fits <- foreach(i = 1:3, .packages = c("Matrix")) %dopar% {
     
-    source("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/algorithms/MCMC.R")
+    source(file.path(dir, "algorithms", "MCMC.R"))
     
     start <- Sys.time()
     
@@ -925,7 +898,6 @@ ds_II_MCMC <-
     # Priors 
     mu_beta, Sigma_beta,
     var_shape=0.001, var_rate=0.001,
-    Poisson=FALSE,
     # Hyperparameters 
     n_mcmc){
     
@@ -1077,13 +1049,8 @@ ds_II_MCMC <-
         N_star = N_I[i,sample(n_samp, 1, TRUE)]
         
         # Metropolis-Hastings ratio
-        if(Poisson){
-          mh1 = dpois(N_star, exp(log_lambda[i+n_z]), TRUE)
-          mh2 = dpois(N[i], exp(log_lambda[i+n_z]), TRUE)
-        } else {
-          mh1 = NB_polson_N(N_star, nu, log_lambda[i+n_z])
-          mh2 = NB_polson_N(N[i], nu, log_lambda[i+n_z])
-        }
+        mh1 = NB_polson_N(N_star, nu, log_lambda[i+n_z])
+        mh2 = NB_polson_N(N[i], nu, log_lambda[i+n_z])
         mh = exp(mh1 - mh2)
         
         # Accept or reject
@@ -1102,12 +1069,7 @@ ds_II_MCMC <-
       tau_save[q] = tau
 
       ### Timer
-      ### Timer
-      if(Poisson){
-        if (q %% 100 == 0) cat(q, " ")
-      } else {
-        if (q %% 1000 == 0) cat(q, " ")
-      }
+      if (q %% 1000 == 0) cat(q, " ")
     }
     
     
