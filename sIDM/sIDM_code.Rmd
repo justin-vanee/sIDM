@@ -9,7 +9,7 @@ date: "2025-09-05"
 ```{r setup, include=FALSE}
 
 ### Set directory 
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
+dir <- "/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/sIDM"
 
 ###
 ### Packages
@@ -49,15 +49,16 @@ library(tidyverse)
 library(units)
 library(wesanderson)
 library(xtable)
+
 ###
 ### Functions 
 ###
 
-source("algorithms/MCMC.R")
+source(file.path(dir, "algorithms", "MCMC.R"))
 ```
 
 
-# Data preparation for brook trout analysis (only for viewing: data not available due to size restrictions, will be made available upon request or publication) 
+# Data preparation for brook trout analysis (only for viewing: raw data not available due to privacy restrictions) 
 
 ## Read in data 
 
@@ -1258,20 +1259,17 @@ save(data, file="Outputs/data.RData")
 
 ```{r, fit model reals data}
 
-### Load algorithms for fitting
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-source("algorithms/MCMC.R")
-
 ### Number MCMC iterations 
-n_mcmc = 2e4
+n_mcmc = 20000
 
 ### Fit Models in parallel 
 fit_list <- fit_models_real_parallel(n_mcmc = n_mcmc, 
                                      c_1 = 0.7, 
-                                     n_cores = 3)
+                                     n_cores = 3,
+                                     dir = dir)
 
 ### Save output 
-#save(fit_list, file="Outputs/fit_list.RData")
+#save(fit_list, file=file.path(dir, "Outputs", "fit_list.RData"))
 
 ###
 ### Inspect fit 
@@ -1374,14 +1372,10 @@ ggplot(log_lambda_df, aes(x = value, color = model, fill = model)) +
 ```{r, fit model reals data}
 
 ### Load data
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load("Outputs/data.RData")
+load(file.path(dir, "Outputs", "data.RData"))
 stan_data <- data
 
 ### Nix some large objects 
-stan_data$cov_data <- NULL
-stan_data$all_data <- NULL
-stan_data$eta_COV <- NULL
 stan_data$y <- NULL
   
 ### Indices
@@ -1392,12 +1386,10 @@ site_levels <- sort(unique(site_idx))
 n <- length(site_levels)
 
 ### Matrices
-D <- bdiag(stan_data$D)
-D <- as.matrix(D[site_levels, site_levels])
 zeta_COV <- solve(diag(rowSums(data$A)) - 0.999 * data$A)
 
 ### Redefine some objects 
-stan_data$D <- D
+stan_data$D <- as.matrix(bdiag(stan_data$D))
 stan_data$zeta_COV <- zeta_COV
 stan_data$n <- n
 stan_data$q_idx <- data$q_idx[site_levels]
@@ -1407,7 +1399,7 @@ stan_data$z_site_idx <- as.integer(factor(data$z_site_idx, levels = site_levels)
 stan_data$y_site_idx <- as.integer(factor(data$y_site_idx, levels = site_levels))
 
 # Compile the model
-mod <- cmdstan_model("algorithms/IDM.stan")
+mod <- cmdstan_model(file.path(dir, "algorithms", "IDM.stan"))
 
 # Run Pathfinder
 pathfinder_fit <- mod$pathfinder(
@@ -1418,7 +1410,6 @@ pathfinder_fit <- mod$pathfinder(
 
 # Extract good initial values
 init_list <- pathfinder_fit$draws(format = "list")
-load(file="Outputs/init_list.RData")
 
 ###
 ### Fit HMC (estimated run time over 1 month!)
@@ -1434,8 +1425,6 @@ trout_HMC <- mod$sample(
   refresh = 1
 )
 
-### Load fit
-load(file="Outputs/trout_HMC.RData")
 
 ### summary
 trout_HMC$summary(variables = c("sigma2_eta", "sigma2_zeta", "sigma2_xi", "rho_xi",
@@ -1482,13 +1471,11 @@ trout_VI$summary(variables = c("phi","sigma2_eta", "sigma2_zeta", "sigma2_xi", "
 hist(trout_VI$summary(variables = c("log_lambda"))$mean) # Count sites
 hist(trout_VI$summary(variables = c("log_prob"))$mean) # Presence/absence sites
 
-# Output 
-save(trout_VI, file="Outputs/trout_VI.RData")
 ```
 
 # Plotting (covariate associations and species spatial intensity, can skip here "data" and "fit_list" available)
 
-## Posterior Prediction of Intensity 
+## Posterior Prediction of Intensity (only for review, cannot release spatial locations for krigging)
 
 ```{r, Extract prediction points for presence analysis }
 
@@ -1675,7 +1662,7 @@ ggplot(eta_all) +
 save(intensity_pred, file="Outputs/intensity_pred.RData")
 ```
 
-## Plot Intensity 
+## Plot Intensity  (only for review, cannot release spatial locations for krigging)
 
 ```{r, plot a single network}
 
@@ -1855,9 +1842,7 @@ ggsave(plot = combined_plot,
 ### Load model fits
 ###
 
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/fit_list.RData")
-load(file="Outputs/Data.RData")
+load(file.path(dir, "Outputs", "fit_list.RData"))
 
 PG_joint_out=fit_list$PG_joint_out
 PG_binary_out=fit_list$PG_binary_out
@@ -1947,107 +1932,6 @@ ggsave(beta_ridges,
 ```
 
 
-# Assess model fit (RPS)
-
-```{r, Assess model fit (RPS)}
-
-###
-### Load model fits
-###
-
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/fit_list.RData")
-load(file="Outputs/Data.RData")
-load(file="Outputs/trout_VI.RData")
-source("algorithms/MCMC.R")
-
-### Extract model fit 
-PG_joint_out=fit_list$PG_joint_out
-
-###
-### Extract total fish count for each site and presence/absence
-###
-
-z <- data$z_flat
-n_z <- length(z)
-
-###
-### PPD (Geometric IDM)
-###
-
-burnin <- 1000
-samples <- 1000
-thin_seq <- seq(from=burnin, to=ncol(PG_joint_out$log_lambda[-c(1:n_z),]), length.out=samples)
-psi <- logit_inv(PG_joint_out$log_lambda[-c(1:n_z),thin_seq])
-
-### Extract probability of occupancy for presence/absence sites
-psi_z <- logit_inv(PG_joint_out$log_lambda[1:n_z,thin_seq])
-z_GR <-
-  rbinom(
-    n_z * samples,
-    size = 1,
-    prob = psi_z
-  )
-
-###
-### PPD (Poisson IDM)
-###
-
-### Extract probability of occupancy for presence/absence sites
-log_prob <- 
-  trout_VI$draws("log_prob") %>%
-  t() 
-prob <- 1-exp(-exp(log_prob))
-z_VI <-
-  rbinom(
-    n_z * samples,
-    size = 1,
-    prob = prob
-  )
-
-###
-### Ranked Probability Score (presence/absence, simplifies to RMSE)
-###
-
-## gIDM
-GR_RPS <- apply(psi_z, 2, function(x) (z-x)^2)
-GR_site <- apply(GR_RPS, 1, mean)
-
-## VI
-VI_RPS <- apply(prob, 2, function(x) (z-x)^2)
-VI_site <- apply(VI_RPS, 1, mean)
-
-###
-### Calculate Time Required to Obtain 1000 Independent Samples
-###
-
-GR <- 1000 / (mean(apply(PG_joint_out$beta[,-c(1:burnin)], 1, mcmcse::ess)) / fit_list$time[1]) 
-VI <- as.vector(trout_VI$time()$total) / 60  # Time in seconds 
-
-
-# Function to summarize each matrix
-mean_sd_format <- function(vector) {
-  sprintf("%.2f (%.2f)", mean(vector), sd(vector))
-}
-
-# Create a data frame for the table
-summary_df <- rbind(
-  VI = mean(VI_site),
-  #HMC = mean_sd_format(beta_HMC),
-  GR = mean(GR_site)
-) %>%
-  cbind(
-    round(c(VI, GR))
-  )
-
-# Assign column names
-colnames(summary_df) <- c("Ranked Probability Score", "Time")
-
-# Convert to xtable and print
-latex_table <- xtable(summary_df, align = "lcc")
-print(latex_table, sanitize.text.function = identity)
-```
-
 # Simulation study in parallel (geostatistical model)
 
 ## Sample size (n) varying
@@ -2060,7 +1944,7 @@ print(latex_table, sanitize.text.function = identity)
 
 # Set parameters
 p <- 5
-v_prop <- 0.8
+z_prop <- 0.8
 n_values <- c(100, 200, 300, 500, 1000)
 
 # Repeat each n value 100 times for total 300 simulations
@@ -2068,7 +1952,7 @@ n_list <- rep(n_values, each = 100)
 
 # Define wrapper for your simulation function
 simulate_wrapper <- function(n) {
-  simulate_data(n = n, v_prop = v_prop, p = p)
+  simulate_data(n = n, z_prop = z_prop, p = p)
 }
 
 # Define packages used 
@@ -2102,11 +1986,6 @@ hist(map_dbl(data_list, ~.$sigma2))
 ### Fit models in parallel
 ###
 
-# Data list & Functions
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/Data_list_p5.RData")
-source("algorithms/MCMC.R")
-
 # Define parameters
 iter_sampling <- 1000
 iter_warmup <- 200
@@ -2116,7 +1995,7 @@ VI_iter <- 5e4
 VI_draws <- 1e3
 
 # Register parallel backend
-n_cores <- 8  # leave one core free
+n_cores <- 5  # leave one core free
 cl <- makeCluster(n_cores)
 registerDoParallel(cl)
 
@@ -2128,13 +2007,14 @@ metrics <- foreach(data = data_list,
                    .combine = rbind,
                    .packages = packages_list,
                    .export = "fit_models",
-                   .errorhandling = "remove") %dopar% {
+                   .errorhandling = "stop") %dopar% {
 
   fit_models(
     data,
     iter_sampling, iter_warmup, chains=1,
     n_mcmc, burnin,
     VI_iter, VI_draws,
+    dir=dir,
     Models = c("gIDM", "VI")
   )
                    }
@@ -2154,7 +2034,7 @@ metrics %>%
   summarise(across(time:ess_lambda, mean, na.rm=TRUE)) 
 
 # Save output
-save(metrics, file="Outputs/metrics_p5.RData")
+#save(metrics, file=file.path(dir, "Outputs", "metrics_p5.RData"))
 ```
 
 ### Plot Simulation Results 
@@ -2165,10 +2045,7 @@ save(metrics, file="Outputs/metrics_p5.RData")
 ### Load data
 ###
 
-### Set directory 
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/metrics_p5.RData")
-load(file="Outputs/Data_list_p5.RData")
+#load(file=file.path(dir, "Outputs", "metrics_p5.RData"))
 
 
 ### Bind select outputs from datasets 
@@ -2304,7 +2181,7 @@ ggsave(simulation_plot,
 ###
 
 # Set parameters
-n <- 500
+n <- 100
 p <- 5
 z_prop <- 0.8
 nu_values <- c(1, 10, 100)
@@ -2342,18 +2219,11 @@ for(i in 1:length(nu_list)){
 # Check distribution of simulated values 
 hist(map_dbl(data_list, ~log(sd(.$N))))
 
-# Save datasets 
-# save(data_list, file="Outputs/Data_list_p5_n500_nu.RData")
-
 
 ###
 ### Fit models in parallel
 ###
 
-# Data list & Functions
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/Data_list_p5_n100_nu.RData")
-source("algorithms/MCMC.R")
 
 # Define parameters
 iter_sampling <- 1000
@@ -2383,6 +2253,7 @@ metrics <- foreach(data = data_list,
     iter_sampling, iter_warmup, chains=1,
     n_mcmc, burnin,
     VI_iter, VI_draws,
+    dir = dir, 
     Models = c("gIDM", "HMC", "VI")
   )
                    }
@@ -2402,7 +2273,7 @@ metrics %>%
   summarise(across(time:rejection, mean, na.rm=TRUE)) 
 
 # Save metrics 
-save(metrics, file="Outputs/metrics_p5_n100_nu_II.RData")
+#save(metrics, file=file.path(dir, "Outputs", "metrics_p5_n100_nu.RData"))
 
 ```
 
@@ -2414,10 +2285,7 @@ save(metrics, file="Outputs/metrics_p5_n100_nu_II.RData")
 ### Load data
 ###
 
-### Set directory 
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-load(file="Outputs/metrics_p5_n100_nu.RData")
-load(file="Outputs/Data_list_p5_n100_nu.RData")
+load(file=file.path(dir, "Outputs", "metrics_p5_n100_nu.RData"))
 
 
 ### Bind select outputs from datasets 
@@ -2548,19 +2416,23 @@ ggsave(simulation_plot,
 
 ```{r, Prepare data}
 
-### Set directory 
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc/Kery_2024")
-
 # Load data ----
 # Distance Sampling (DS) data from Oregon2020
-head(DS <- read.table("data/amro_obsdetection.csv",header=T,sep=";",as.is = T))
+head(DS <- read.table(file.path(dir, "Kery_2024", "data", "amro_obsdetection.csv"),header=T,sep=";",as.is = T))
 DS$Distance <- DS$Distance/1000 # Convert to km
 
 # Table including covariates and Oregon2020 counts (particularly the zeros) 
-head(sitecovs <- read.table("data/amro_sitecovs_simplified.csv",header=T,sep=";",as.is = T))
+head(sitecovs <- 
+       read.table(file.path(dir, "Kery_2024", "data", "amro_sitecovs_simplified.csv"), 
+                  header=T,
+                  sep=";",
+                  as.is = T))
 
 # eBird
-head(PC <- read.table("data/amro_ebird_simplified.csv",header=T,sep=";",as.is = T))
+head(PC <- read.table(file.path(dir, "Kery_2024", "data", "amro_ebird_simplified.csv"),
+                      header=T,
+                      sep=";",
+                      as.is = T))
 
 # Link DS and zero observations (from sitecovs)
 names(sitecovs)[names(sitecovs) == "Latitude.x"] <- "Latitude" # Homogenize names
@@ -2723,9 +2595,6 @@ summary(glm(colSums(Y) ~ H - 1, family = "poisson")) # number of detections dist
 
 ```{r, real data fit (Stage I)}
 
-### Load algorithms for fitting
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-source("algorithms/MCMC.R")
 
 ### Number MCMC iterations 
 n_mcmc = 10000
@@ -2769,12 +2638,7 @@ hist(rowMeans(ds_I$N))
 
 ```{r, real data fit (Stage II)}
 
-### Load algorithms for fitting
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-source("algorithms/MCMC.R")
-
 ### Load Stage I fit
-load(file="Outputs/ds_I.RData")
 N_I <- ds_I$N[,-c(1:1000)]
 
 ### Number MCMC iterations 
@@ -2788,7 +2652,6 @@ ds_II <-
     # Priors 
     mu_beta, Sigma_beta,
     var_shape=0.001, var_rate=0.001,
-    Poisson=TRUE,
     # Hyperparameters 
     n_mcmc)
 end = Sys.time()
@@ -2832,11 +2695,8 @@ plot_traceplots(t(ds_II$tau), burnin=burnin, param_names=c("tau"))
 
 ```{r, real data fit (Stage II, stan)}
 
-### Load algorithms for fitting
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
 
-### Load Stage I fit
-load(file="Outputs/ds_I.RData")
+### reformat Stage I fit
 N_I <- ds_I$N[,-c(1:1000)]
 
 ###
@@ -2860,7 +2720,7 @@ for (k in 0:M) {
 colnames(pi) <- paste0("count_", 0:M)
 
 # Compile the model
-mod <- cmdstan_model("algorithms/IDS.stan")
+mod <- cmdstan_model(file.path(dir, "algorithms", "IDS.stan"))
 
 # Data list for Stan
 data_list <- list(
@@ -2923,9 +2783,6 @@ mcmc_trace(draws_array, pars = vars(matches("^xi(\\[|$)")))
 # Traceplot for tau
 mcmc_trace(draws_array, pars = vars(contains("tau")))
 
-# Save fit 
-#save(HMC_fit, file="Outputs/HMC_fit.RData")
-
 ###
 ### Fit Variational Inference  
 ###
@@ -2934,35 +2791,25 @@ VI_fit <- mod$variational(
   data = data_list,
   algorithm = "meanfield",
   output_samples = 1000,
-  seed = 123,
-  adapt_engaged = TRUE
+  adapt_engaged = TRUE,
+  seed = 123
 )
 
 # Check everything converged  
 VI_fit$summary(variables = c("beta", "xi", "tau"))
 
-# Save fit 
-#save(VI_fit, file="Outputs/VI_fit.RData")
 ```
 
 # Visualize/map American robin density in Oregon
 
 ```{r, Visualize/Map American Robin Density in Oregon}
 
-# Set working directory
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-
-# Load model fit 
-load(file="Outputs/ds_II.RData")
-
 # Load model fit (Kery 2024) & Extract beta
-load(file="Outputs/out5A.RData")
+load(file=file.path(dir, "Outputs", "out5A.RData"))
 
 # For adjusting intercepts 
 adj <- mean(as.matrix(out5A$samples)[,16])
 
-# Load model fit (HMC) & Extract beta
-load(file="Outputs/HMC_fit.RData")
 # Extract all draws of 'beta' (all chains)
 beta_draws_array <- HMC_fit$draws(variables = "beta")
 # Convert to a flat matrix: (iterations * chains) × parameters
@@ -2971,17 +2818,19 @@ beta_matrix <- as_draws_matrix(beta_draws_array)
 beta_HMC <- t(beta_matrix)
 
 # Load model fit (HMC) & Extract beta
-load(file="Outputs/VI_fit.RData")
 beta_VI <- t(VI_fit$draws(variables = "beta"))
 
 # Load environmental data
-head(centroids <- read.table("Kery_2024/data/env_centroids.csv",header=T,sep=";",as.is = T))
+head(centroids <- read.table(file.path(dir, "Kery_2024", "data", "env_centroids.csv"),
+                             header=T,
+                             sep=";",
+                             as.is = T))
 
 #load in file with desired crs
-polygon.grid <- st_read("Kery_2024/data/geodata/grid_1km.shp")
+polygon.grid <- st_read(file.path(dir, "Kery_2024", "data", "geodata", "grid_1km.shp"))
 
 # mask for study area
-mask <- st_read("Kery_2024/data/geodata/StudyArea.shp")
+mask <- st_read(file.path(dir, "Kery_2024", "data", "geodata", "StudyArea.shp"))
 
 # adjust variables as they were in the model data
 centroids$cancov.scaled <- (centroids$cancov - 50)/100
@@ -3272,23 +3121,18 @@ round(range(apply(centroids.predictions,1,median)),1) # range of median estimate
 writeRaster(centroids.predictions.output_rast, "IDS_AMRO_PredictedAbundance.tif", filetype = "GTiff", overwrite = TRUE)
 
 ```
+
 # Compare posteriors covariate Effects 
 
 ```{r, Compare Posteriors Covariate Effects }
 
-# Set working directory
-setwd("/Users/justinvanee/Library/Mobile Documents/com~apple~CloudDocs/Documents/brook_trout_postdoc")
-
 # Load model fit 
-load(file="Outputs/ds_II.RData")
 beta <- ds_II$beta
 
 # Load model fit (Kery 2024) & Extract beta
-load(file="Outputs/out5A.RData")
 beta_Kery <- t(as.matrix(out5A$samples[,16:20]))
 
 # Load model fit (HMC) & Extract beta
-load(file="Outputs/HMC_fit.RData")
 # Extract all draws of 'beta' (all chains)
 beta_draws_array <- HMC_fit$draws(variables = "beta")
 # Convert to a flat matrix: (iterations * chains) × parameters
@@ -3297,7 +3141,6 @@ beta_matrix <- as_draws_matrix(beta_draws_array)
 beta_HMC <- t(beta_matrix)
 
 # Load model fit (HMC) & Extract beta
-load(file="Outputs/VI_fit.RData")
 beta_VI <- t(VI_fit$draws(variables = "beta"))
 
 ###
